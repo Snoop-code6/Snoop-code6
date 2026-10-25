@@ -1,4 +1,6 @@
 import express from 'express';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   clearSessionCookie, createSession, deleteSession, hashPassword, newToken,
@@ -9,6 +11,11 @@ import { transaction } from './db.js';
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
 const PAGE_SIZE = 50;
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024;
+const MAX_ATTACHMENTS = 10;
+const ORPHAN_TTL_MS = 24 * 3600 * 1000;
+// Seules ces images sont affichées dans la page ; tout le reste est proposé en téléchargement.
+const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -34,10 +41,11 @@ function intParam(value) {
 }
 
 const toUser = (u) => ({ id: u.id, email: u.email, name: u.name, role: u.role });
-const toMessage = (m) => ({
-  id: m.id, channelId: m.channel_id, userId: m.user_id, body: m.body,
-  createdAt: m.created_at, editedAt: m.edited_at,
-});
+const THREAD_STATS = `
+  (SELECT COUNT(*) FROM messages r WHERE r.parent_id = m.id) AS reply_count,
+  (SELECT MAX(r.created_at) FROM messages r WHERE r.parent_id = m.id) AS last_reply_at`;
+
+const toAttachment =(a) => ({ id: a.id, name: a.name, mime: a.mime, size: a.size });
 const toPage = (p) => ({
   id: p.id, parentId: p.parent_id, title: p.title, content: p.content, version: p.version,
   createdBy: p.created_by, updatedBy: p.updated_by, createdAt: p.created_at, updatedAt: p.updated_at,
@@ -66,7 +74,9 @@ function loginLimiter({ max = 10, windowMs = 15 * 60 * 1000 } = {}) {
   };
 }
 
-export function createApp({ db, hub }) {
+export function createApp({ db, hub, uploadDir: dir }) {
+  const uploadDir = resolve(dir);
+  mkdirSync(uploadDir, { recursive: true });
   const app = express();
   const limiter = loginLimiter();
   app.disable('x-powered-by');
@@ -122,17 +132,30 @@ export function createApp({ db, hub }) {
       SELECT c.id, c.name, c.topic, c.is_dm, m.user_id IS NOT NULL AS joined,
         CASE WHEN m.user_id IS NULL THEN 0 ELSE (
           SELECT COUNT(*) FROM messages x
-          WHERE x.channel_id = c.id AND x.id > m.last_read_id AND x.user_id IS NOT ?
+          WHERE x.channel_id = c.id AND x.parent_id IS NULL AND x.id > m.last_read_id AND x.user_id IS NOT ?
         ) END AS unread
       FROM channels c
       LEFT JOIN channel_members m ON m.channel_id = c.id AND m.user_id = ?
       WHERE c.is_dm = 0 OR m.user_id IS NOT NULL
       ORDER BY c.is_dm, c.name`),
-    messagesBefore: db.prepare('SELECT * FROM messages WHERE channel_id = ? AND id < ? ORDER BY id DESC LIMIT ?'),
-    message: db.prepare('SELECT * FROM messages WHERE id = ?'),
-    insertMessage: db.prepare('INSERT INTO messages (channel_id, user_id, body, created_at) VALUES (?, ?, ?, ?)'),
+    messagesBefore: db.prepare(`SELECT m.*, ${THREAD_STATS} FROM messages m
+      WHERE m.channel_id = ? AND m.parent_id IS NULL AND m.id < ? ORDER BY m.id DESC LIMIT ?`),
+    message: db.prepare(`SELECT m.*, ${THREAD_STATS} FROM messages m WHERE m.id = ?`),
+    replies: db.prepare('SELECT * FROM messages WHERE parent_id = ? ORDER BY id LIMIT 1000'),
+    insertMessage: db.prepare('INSERT INTO messages (channel_id, user_id, parent_id, body, created_at) VALUES (?, ?, ?, ?, ?)'),
     updateMessage: db.prepare('UPDATE messages SET body = ?, edited_at = ? WHERE id = ?'),
     deleteMessage: db.prepare('DELETE FROM messages WHERE id = ?'),
+    insertAttachment: db.prepare(`INSERT INTO attachments (channel_id, user_id, name, mime, size, storage_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`),
+    attachment: db.prepare('SELECT * FROM attachments WHERE id = ?'),
+    linkAttachment: db.prepare(`UPDATE attachments SET message_id = ?
+      WHERE id = ? AND user_id = ? AND channel_id = ? AND message_id IS NULL`),
+    attachmentsFor: db.prepare(`SELECT * FROM attachments
+      WHERE message_id IN (SELECT value FROM json_each(?)) ORDER BY id`),
+    attachmentsOfTree: db.prepare(`SELECT storage_key FROM attachments
+      WHERE message_id = ?1 OR message_id IN (SELECT id FROM messages WHERE parent_id = ?1)`),
+    orphanAttachments: db.prepare('SELECT id, storage_key FROM attachments WHERE message_id IS NULL AND created_at < ?'),
+    deleteAttachment: db.prepare('DELETE FROM attachments WHERE id = ?'),
     pages: db.prepare('SELECT id, parent_id, title, updated_at FROM pages ORDER BY created_at, id'),
     page: db.prepare('SELECT * FROM pages WHERE id = ?'),
     insertPage: db.prepare(`INSERT INTO pages (parent_id, title, content, created_by, updated_by, created_at, updated_at)
@@ -179,6 +202,39 @@ export function createApp({ db, hub }) {
     if (channel.is_dm) hub.sendTo(q.members.all(channel.id).map((r) => r.user_id), event);
     else hub.broadcast(event);
   }
+
+  // Transforme des lignes de la table messages en objets d'API, pièces jointes comprises.
+  function toMessages(rows) {
+    const byMessage = new Map();
+    if (rows.length) {
+      for (const a of q.attachmentsFor.all(JSON.stringify(rows.map((r) => r.id)))) {
+        if (!byMessage.has(a.message_id)) byMessage.set(a.message_id, []);
+        byMessage.get(a.message_id).push(toAttachment(a));
+      }
+    }
+    return rows.map((m) => ({
+      id: m.id, channelId: m.channel_id, userId: m.user_id, parentId: m.parent_id, body: m.body,
+      createdAt: m.created_at, editedAt: m.edited_at,
+      replyCount: m.reply_count ?? 0, lastReplyAt: m.last_reply_at ?? null,
+      attachments: byMessage.get(m.id) ?? [],
+    }));
+  }
+
+  const toMessage = (row) => toMessages([row])[0];
+
+  function removeFiles(keys) {
+    for (const key of keys) rmSync(join(uploadDir, key), { force: true });
+  }
+
+  // Supprime les fichiers envoyés mais jamais publiés dans un message.
+  function cleanupOrphans() {
+    for (const a of q.orphanAttachments.all(Date.now() - ORPHAN_TTL_MS)) {
+      q.deleteAttachment.run(a.id);
+      removeFiles([a.storage_key]);
+    }
+  }
+  cleanupOrphans();
+  setInterval(cleanupOrphans, 3600 * 1000).unref();
 
   function login(req, res, userId) {
     const { token, expiresAt } = createSession(db, userId);
@@ -256,7 +312,7 @@ export function createApp({ db, hub }) {
 
   api.use(requireUser);
 
-  api.get('/me', (req, res) => res.json({ user: req.user }));
+  api.get('/me', (req, res) => res.json({ user: req.user, limits: { maxUploadBytes: MAX_UPLOAD_BYTES, maxAttachments: MAX_ATTACHMENTS } }));
 
   api.get('/users', (req, res) => {
     res.json({ users: q.users.all().map(toUser), online: hub.online() });
@@ -331,27 +387,91 @@ export function createApp({ db, hub }) {
     const before = Number(req.query.before) || Number.MAX_SAFE_INTEGER;
     const rows = q.messagesBefore.all(channel.id, before, PAGE_SIZE + 1);
     const hasMore = rows.length > PAGE_SIZE;
-    res.json({ messages: rows.slice(0, PAGE_SIZE).reverse().map(toMessage), hasMore });
+    res.json({ messages: toMessages(rows.slice(0, PAGE_SIZE).reverse()), hasMore });
   });
 
   api.post('/channels/:id/messages', (req, res) => {
     const channel = readableChannel(intParam(req.params.id), req.user);
-    const body = text(req.body?.body, 'message', { min: 1, max: 4000 });
+    const ids = req.body?.attachmentIds ?? [];
+    if (!Array.isArray(ids) || ids.length > MAX_ATTACHMENTS || !ids.every(Number.isInteger)) {
+      fail(400, `${MAX_ATTACHMENTS} pièces jointes maximum par message.`);
+    }
+    const body = text(req.body?.body ?? '', 'message', { min: ids.length ? 0 : 1, max: 4000 });
+
+    let parentId = null;
+    if (req.body?.parentId != null) {
+      const parent = q.message.get(Number(req.body.parentId));
+      if (!parent || parent.channel_id !== channel.id) fail(404, 'Message d’origine introuvable.');
+      // Un seul niveau de fil : répondre à une réponse revient à répondre au message d'origine.
+      parentId = parent.parent_id ?? parent.id;
+    }
+
     const message = transaction(db, () => {
       q.join.run(channel.id, req.user.id, channel.id);
-      const id = q.insertMessage.run(channel.id, req.user.id, body, Date.now()).lastInsertRowid;
-      q.markRead.run(id, channel.id, req.user.id);
+      const id = q.insertMessage.run(channel.id, req.user.id, parentId, body, Date.now()).lastInsertRowid;
+      for (const attachmentId of ids) {
+        if (q.linkAttachment.run(id, attachmentId, req.user.id, channel.id).changes === 0) {
+          fail(400, 'Pièce jointe invalide ou déjà publiée.');
+        }
+      }
+      if (!parentId) q.markRead.run(id, channel.id, req.user.id);
       return toMessage(q.message.get(id));
     });
     emitToChannel(channel, { type: 'message:new', message });
     res.status(201).json({ message });
   });
 
+  api.get('/messages/:id/replies', (req, res) => {
+    const root = q.message.get(intParam(req.params.id));
+    if (!root || root.parent_id) fail(404, 'Fil introuvable.');
+    readableChannel(root.channel_id, req.user);
+    res.json({ message: toMessage(root), replies: toMessages(q.replies.all(root.id)) });
+  });
+
+  // Le fichier arrive brut dans le corps de la requête ; son nom et son type sont dans les en-têtes.
+  api.post('/channels/:id/attachments', express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }), (req, res) => {
+    const channel = readableChannel(intParam(req.params.id), req.user);
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) fail(400, 'Fichier vide.');
+    let name;
+    try {
+      name = decodeURIComponent(req.get('X-Filename') ?? '');
+    } catch {
+      name = '';
+    }
+    name = name.replace(/[\\/\u0000-\u001f\u007f]/g, '_').trim().slice(0, 200) || 'fichier';
+    const mime = /^[\w.+-]+\/[\w.+-]+$/.test(req.get('X-File-Type') ?? '')
+      ? req.get('X-File-Type').toLowerCase()
+      : 'application/octet-stream';
+    const key = newToken();
+    writeFileSync(join(uploadDir, key), req.body);
+    const id = q.insertAttachment.run(channel.id, req.user.id, name, mime, req.body.length, key, Date.now()).lastInsertRowid;
+    res.status(201).json({ attachment: toAttachment(q.attachment.get(id)) });
+  });
+
+  api.get('/attachments/:id', (req, res) => {
+    const a = q.attachment.get(intParam(req.params.id));
+    if (!a) fail(404, 'Fichier introuvable.');
+    readableChannel(a.channel_id, req.user);
+    // Tant qu'il n'est pas publié, un fichier n'est visible que de la personne qui l'a envoyé.
+    if (!a.message_id && a.user_id !== req.user.id) fail(404, 'Fichier introuvable.');
+    const inline = INLINE_IMAGES.has(a.mime);
+    res.set({
+      'Content-Type': inline ? a.mime : 'application/octet-stream',
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(a.name)}`,
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Cache-Control': 'private, max-age=86400',
+    });
+    res.sendFile(join(uploadDir, a.storage_key), { cacheControl: false }, (err) => {
+      if (err && !res.headersSent) res.status(404).json({ error: 'Fichier introuvable.' });
+    });
+  });
+
   api.patch('/messages/:id', (req, res) => {
     const message = q.message.get(intParam(req.params.id));
     if (!message) fail(404, 'Message introuvable.');
     if (message.user_id !== req.user.id) fail(403, 'Vous ne pouvez modifier que vos messages.');
-    const body = text(req.body?.body, 'message', { min: 1, max: 4000 });
+    const hasFiles = q.attachmentsFor.all(JSON.stringify([message.id])).length > 0;
+    const body = text(req.body?.body, 'message', { min: hasFiles ? 0 : 1, max: 4000 });
     q.updateMessage.run(body, Date.now(), message.id);
     const updated = toMessage(q.message.get(message.id));
     emitToChannel(q.channel.get(message.channel_id), { type: 'message:updated', message: updated });
@@ -362,9 +482,11 @@ export function createApp({ db, hub }) {
     const message = q.message.get(intParam(req.params.id));
     if (!message) fail(404, 'Message introuvable.');
     if (message.user_id !== req.user.id && req.user.role !== 'admin') fail(403, 'Vous ne pouvez supprimer que vos messages.');
+    const files = q.attachmentsOfTree.all(message.id).map((a) => a.storage_key);
     q.deleteMessage.run(message.id);
+    removeFiles(files);
     emitToChannel(q.channel.get(message.channel_id), {
-      type: 'message:deleted', messageId: message.id, channelId: message.channel_id,
+      type: 'message:deleted', messageId: message.id, channelId: message.channel_id, parentId: message.parent_id,
     });
     res.status(204).end();
   });
@@ -441,7 +563,7 @@ export function createApp({ db, hub }) {
     const term = String(req.query.q ?? '').trim();
     if (term.length < 2) return res.json({ messages: [], pages: [] });
     const like = `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
-    const messages = q.searchMessages.all(req.user.id, like).map(toMessage);
+    const messages = toMessages(q.searchMessages.all(req.user.id, like));
     const pages = q.searchPages.all(like).map((p) => ({ ...pageSummary(p), excerpt: excerpt(p.content, term) }));
     res.json({ messages, pages });
   });

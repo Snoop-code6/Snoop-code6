@@ -9,6 +9,8 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 - Messages privés entre deux personnes
 - Temps réel (WebSocket) avec reconnexion automatique
 - Compteurs de messages non lus, présence en ligne
+- **Fils de discussion** : répondre à un message sans encombrer le canal, compteur de réponses en direct
+- **Pièces jointes** : bouton trombone, glisser-déposer ou copier-coller ; aperçu des images, téléchargement des autres fichiers (10 par message, 20 Mo chacun par défaut)
 - Modification / suppression de ses messages (les admins peuvent supprimer)
 - Mise en forme Markdown : **gras**, *italique*, `code`, listes, liens, @mentions
 - Historique paginé
@@ -42,7 +44,11 @@ Ouvrez http://localhost:3000, créez le compte administrateur, puis invitez vos 
 | `PORT`        | `3000`              | Port HTTP                                                   |
 | `HOST`        | toutes interfaces   | Adresse d'écoute                                            |
 | `DB_FILE`     | `data/makora.db`    | Fichier SQLite (à sauvegarder régulièrement)                |
+| `UPLOAD_DIR`  | `data/uploads`      | Dossier des pièces jointes (à sauvegarder avec la base)     |
+| `MAX_UPLOAD_MB` | `20`              | Taille maximale d'une pièce jointe, en Mo                   |
 | `TRUST_PROXY` | non défini          | À définir (ex. `1`) derrière un reverse proxy HTTPS         |
+
+La base et le dossier des pièces jointes sont mis à niveau automatiquement au démarrage quand une nouvelle version ajoute des fonctionnalités.
 
 En production, placez l'application derrière un reverse proxy HTTPS (Caddy, Nginx…) qui transmet aussi les WebSocket sur `/ws`.
 
@@ -73,13 +79,15 @@ test/
 
 - Mots de passe hachés avec scrypt, sessions en cookie `HttpOnly` / `SameSite=Lax`
 - Protection CSRF par en-tête obligatoire sur les écritures, vérification de l'origine des WebSocket
+- Les pièces jointes suivent les droits du canal (un fichier d'une conversation privée reste privé) ; seules les images PNG, JPEG, GIF et WebP s'affichent dans la page, tout autre fichier (HTML, SVG…) est forcé en téléchargement dans un bac à sable
 - Tout le contenu saisi est échappé avant le rendu Markdown ; seuls les liens `http(s)`, `mailto` et internes sont autorisés
 - En-têtes de sécurité (CSP stricte, `X-Frame-Options`…), limitation des tentatives de connexion
 
 ## Pistes pour la suite
 
-- Fils de discussion et réactions emoji sur les messages
-- Pièces jointes (fichiers, images)
+- Réactions emoji sur les messages
+- Notification quand quelqu'un répond dans un fil auquel on participe
+- Pièces jointes dans les pages
 - Notifications navigateur et email
 - Canaux privés à plusieurs, gestion des membres et des rôles par l'admin
 - Éditeur de pages par blocs (WYSIWYG) et historique des versions

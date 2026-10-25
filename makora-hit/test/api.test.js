@@ -279,3 +279,150 @@ describe('markdown', () => {
     assert.match(html, /<pre><code>&lt;b&gt;code&lt;\/b&gt;<\/code><\/pre>/);
   });
 });
+
+describe('pièces jointes', () => {
+  async function upload(who, channelId, content, name, type) {
+    const res = await fetch(`${base}/api/channels/${channelId}/attachments`, {
+      method: 'POST',
+      headers: {
+        'X-Makora': '1', Cookie: who.cookie, 'Content-Type': 'application/octet-stream',
+        'X-Filename': encodeURIComponent(name), 'X-File-Type': type,
+      },
+      body: content,
+    });
+    return { status: res.status, data: await res.json() };
+  }
+  const download = (who, id) => fetch(`${base}/api/attachments/${id}`, { headers: { Cookie: who.cookie } });
+  let general;
+
+  before(async () => {
+    general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+  });
+
+  test('envoyer un fichier puis le publier dans un message', async () => {
+    const png = Buffer.from('89504e470d0a1a0a', 'hex');
+    const up = await upload(bob, general.id, png, 'capture écran.png', 'image/png');
+    assert.equal(up.status, 201);
+    assert.deepEqual(up.data.attachment, { id: up.data.attachment.id, name: 'capture écran.png', mime: 'image/png', size: 8 });
+
+    // Avant publication, seul l'auteur peut le voir.
+    assert.equal((await download(carol, up.data.attachment.id)).status, 404);
+
+    const { status, data } = await bob.call('POST', `/channels/${general.id}/messages`, { body: '', attachmentIds: [up.data.attachment.id] });
+    assert.equal(status, 201);
+    assert.equal(data.message.attachments[0].name, 'capture écran.png');
+
+    const res = await download(carol, up.data.attachment.id);
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('content-type'), 'image/png');
+    assert.match(res.headers.get('content-disposition'), /^inline; filename\*=UTF-8''capture%20%C3%A9cran\.png$/);
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), png);
+
+    const listed = (await carol.call('GET', `/channels/${general.id}/messages`)).data.messages;
+    assert.equal(listed.find((m) => m.id === data.message.id).attachments.length, 1);
+
+    // Un fichier déjà publié ne peut pas être rattaché à un second message.
+    assert.equal((await bob.call('POST', `/channels/${general.id}/messages`, { body: 'x', attachmentIds: [up.data.attachment.id] })).status, 400);
+  });
+
+  test('les fichiers HTML ou SVG sont toujours téléchargés, jamais affichés', async () => {
+    const up = await upload(bob, general.id, '<script>alert(1)</script>', 'piege.svg', 'image/svg+xml');
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: 'svg', attachmentIds: [up.data.attachment.id] });
+    const res = await download(carol, up.data.attachment.id);
+    assert.equal(res.headers.get('content-type'), 'application/octet-stream');
+    assert.match(res.headers.get('content-disposition'), /^attachment;/);
+    assert.match(res.headers.get('content-security-policy'), /sandbox/);
+  });
+
+  test('on ne peut pas publier le fichier de quelqu’un d’autre', async () => {
+    const up = await upload(bob, general.id, 'secret', 'a.txt', 'text/plain');
+    assert.equal((await carol.call('POST', `/channels/${general.id}/messages`, { body: 'vol', attachmentIds: [up.data.attachment.id] })).status, 400);
+  });
+
+  test('les fichiers d’une conversation privée restent privés', async () => {
+    const adminId = (await admin.call('GET', '/me')).data.user.id;
+    const { data: { channel } } = await bob.call('POST', '/dms', { userId: adminId });
+    const up = await upload(bob, channel.id, 'fiche de paie', 'paie.pdf', 'application/pdf');
+    await bob.call('POST', `/channels/${channel.id}/messages`, { body: 'ci-joint', attachmentIds: [up.data.attachment.id] });
+    assert.equal((await download(admin, up.data.attachment.id)).status, 200);
+    assert.equal((await download(carol, up.data.attachment.id)).status, 404);
+    assert.equal((await upload(carol, channel.id, 'x', 'x.txt', 'text/plain')).status, 404);
+  });
+
+  test('supprimer le message supprime le fichier', async () => {
+    const up = await upload(bob, general.id, 'temp', 'temp.txt', 'text/plain');
+    const { data } = await bob.call('POST', `/channels/${general.id}/messages`, { body: 'à supprimer', attachmentIds: [up.data.attachment.id] });
+    const { readdirSync } = await import('node:fs');
+    const before = readdirSync(srv.uploadDir).length;
+    await bob.call('DELETE', `/messages/${data.message.id}`);
+    assert.equal(readdirSync(srv.uploadDir).length, before - 1);
+    assert.equal((await download(bob, up.data.attachment.id)).status, 404);
+  });
+
+  test('fichier vide refusé', async () => {
+    assert.equal((await upload(bob, general.id, '', 'vide.txt', 'text/plain')).status, 400);
+  });
+});
+
+describe('fils de discussion', () => {
+  let general;
+  let root;
+
+  before(async () => {
+    general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+    root = (await admin.call('POST', `/channels/${general.id}/messages`, { body: 'Qui vient à la réunion ?' })).data.message;
+  });
+
+  test('répondre dans un fil', async () => {
+    const ws = socket(carol.cookie);
+    await ws.opened;
+    const reply = (await bob.call('POST', `/channels/${general.id}/messages`, { body: 'Moi !', parentId: root.id })).data.message;
+    assert.equal(reply.parentId, root.id);
+    const ev = await ws.next((e) => e.type === 'message:new' && e.message.id === reply.id);
+    assert.equal(ev.message.parentId, root.id);
+    ws.ws.close();
+
+    // Répondre à une réponse reste dans le même fil.
+    const nested = (await carol.call('POST', `/channels/${general.id}/messages`, { body: 'Moi aussi', parentId: reply.id })).data.message;
+    assert.equal(nested.parentId, root.id);
+
+    const thread = (await carol.call('GET', `/messages/${root.id}/replies`)).data;
+    assert.equal(thread.message.replyCount, 2);
+    assert.deepEqual(thread.replies.map((r) => r.body), ['Moi !', 'Moi aussi']);
+  });
+
+  test('les réponses n’apparaissent pas dans le canal mais le compteur oui', async () => {
+    const { messages } = (await carol.call('GET', `/channels/${general.id}/messages`)).data;
+    assert.ok(!messages.some((m) => m.parentId));
+    const listed = messages.find((m) => m.id === root.id);
+    assert.equal(listed.replyCount, 2);
+    assert.ok(listed.lastReplyAt);
+  });
+
+  test('les réponses ne comptent pas comme non lues dans le canal', async () => {
+    const before = (await admin.call('GET', '/channels')).data.channels.find((c) => c.id === general.id).unread;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: 'encore une réponse', parentId: root.id });
+    const after = (await admin.call('GET', '/channels')).data.channels.find((c) => c.id === general.id).unread;
+    assert.equal(after, before);
+  });
+
+  test('impossible de répondre à un message d’un autre canal', async () => {
+    const { data: { channel } } = await bob.call('POST', '/channels', { name: 'autre' });
+    assert.equal((await bob.call('POST', `/channels/${channel.id}/messages`, { body: 'x', parentId: root.id })).status, 404);
+  });
+
+  test('un fil privé reste privé', async () => {
+    const adminId = (await admin.call('GET', '/me')).data.user.id;
+    const { data: { channel } } = await bob.call('POST', '/dms', { userId: adminId });
+    const dmRoot = (await bob.call('POST', `/channels/${channel.id}/messages`, { body: 'privé' })).data.message;
+    assert.equal((await carol.call('GET', `/messages/${dmRoot.id}/replies`)).status, 404);
+  });
+
+  test('supprimer le message d’origine supprime le fil', async () => {
+    const id = root.id;
+    assert.equal((await admin.call('DELETE', `/messages/${id}`)).status, 204);
+    assert.equal((await admin.call('GET', `/messages/${id}/replies`)).status, 404);
+    const search = (await admin.call('GET', '/search?q=Moi%20aussi')).data;
+    assert.equal(search.messages.length, 0);
+  });
+});

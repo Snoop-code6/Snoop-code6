@@ -21,9 +21,25 @@ function h(tag, props = {}, ...children) {
 async function api(method, path, body) {
   const headers = { 'X-Makora': '1' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  const res = await fetch(`/api${path}`, {
+  return parseResponse(await fetch(`/api${path}`, {
     method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  }));
+}
+
+async function uploadFile(channelId, file) {
+  return parseResponse(await fetch(`/api/channels/${channelId}/attachments`, {
+    method: 'POST',
+    headers: {
+      'X-Makora': '1',
+      'Content-Type': 'application/octet-stream',
+      'X-Filename': encodeURIComponent(file.name),
+      'X-File-Type': file.type || 'application/octet-stream',
+    },
+    body: file,
+  }));
+}
+
+async function parseResponse(res) {
   const data = res.status === 204 ? null : await res.json().catch(() => null);
   if (!res.ok) {
     const err = new Error(data?.error ?? `Erreur ${res.status}`);
@@ -54,6 +70,20 @@ const timeFmt = new Intl.DateTimeFormat('fr-FR', { hour: '2-digit', minute: '2-d
 const dayFmt = new Intl.DateTimeFormat('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
 const dateTimeFmt = new Intl.DateTimeFormat('fr-FR', { dateStyle: 'medium', timeStyle: 'short' });
 
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} o`;
+  if (bytes < 1024 ** 2) return `${Math.round(bytes / 1024)} Ko`;
+  return `${(bytes / 1024 ** 2).toFixed(1).replace('.', ',')} Mo`;
+}
+
+function relativeTime(ts) {
+  const minutes = Math.round((Date.now() - ts) / 60_000);
+  if (minutes < 1) return 'à l’instant';
+  if (minutes < 60) return `il y a ${minutes} min`;
+  if (new Date(ts).toDateString() === new Date().toDateString()) return `aujourd’hui à ${timeFmt.format(ts)}`;
+  return dateTimeFmt.format(ts);
+}
+
 function dayLabel(ts) {
   const d = new Date(ts);
   const today = new Date();
@@ -67,6 +97,7 @@ function dayLabel(ts) {
 
 const state = {
   me: null,
+  limits: { maxUploadBytes: 20 * 1024 * 1024, maxAttachments: 10 },
   users: new Map(),
   online: new Set(),
   channels: new Map(),
@@ -97,8 +128,9 @@ const root = document.getElementById('app');
 
 async function boot() {
   try {
-    const { user } = await api('GET', '/me');
+    const { user, limits } = await api('GET', '/me');
     state.me = user;
+    state.limits = limits;
     await startApp();
   } catch (err) {
     if (err.status === 401) await showAuth();
@@ -247,7 +279,9 @@ function onEvent(ev) {
         resync();
         break;
       }
-      if (v?.kind === 'channel' && v.id === m.channelId) {
+      if (m.parentId) {
+        if (v?.kind === 'channel' && v.id === m.channelId) addReply(v, m);
+      } else if (v?.kind === 'channel' && v.id === m.channelId) {
         if (!v.messages.some((x) => x.id === m.id)) v.messages.push(m);
         renderMessages(v);
         if (document.visibilityState === 'visible') markRead(v);
@@ -260,10 +294,8 @@ function onEvent(ev) {
     case 'message:updated':
     case 'message:deleted':
       if (v?.kind === 'channel' && v.id === (ev.message?.channelId ?? ev.channelId)) {
-        v.messages = ev.type === 'message:deleted'
-          ? v.messages.filter((m) => m.id !== ev.messageId)
-          : v.messages.map((m) => (m.id === ev.message.id ? ev.message : m));
-        renderMessages(v, { keepScroll: true });
+        if (ev.type === 'message:deleted') removeMessage(v, ev.messageId, ev.parentId);
+        else replaceMessage(v, ev.message);
       }
       break;
     case 'page:changed':
@@ -419,7 +451,12 @@ function route() {
 
   const hash = location.hash;
   let m;
-  if ((m = hash.match(/^#\/c\/(\d+)$/))) openChannel(Number(m[1]));
+  if ((m = hash.match(/^#\/c\/(\d+)(?:\/t\/(\d+))?$/))) {
+    const id = Number(m[1]);
+    const threadId = m[2] ? Number(m[2]) : null;
+    if (prev?.kind === 'channel' && prev.id === id) showThread(prev, threadId);
+    else openChannel(id, threadId);
+  }
   else if ((m = hash.match(/^#\/p\/(\d+)$/))) openPage(Number(m[1]));
   else if ((m = hash.match(/^#\/search\/(.+)$/))) openSearch(decodeURIComponent(m[1]));
   else {
@@ -439,7 +476,7 @@ function showEmpty() {
 
 // --- Canaux ---------------------------------------------------------------
 
-async function openChannel(id) {
+async function openChannel(id, threadId = null) {
   let channel = state.channels.get(id);
   if (!channel) {
     await resync();
@@ -450,18 +487,23 @@ async function openChannel(id) {
     location.hash = '';
     return;
   }
-  const v = { kind: 'channel', id, messages: [], hasMore: false, editingId: null, loading: true };
+  const v = {
+    kind: 'channel', id, messages: [], hasMore: false, editingId: null, loading: true, thread: null, seen: new Set(),
+  };
   state.view = v;
   renderSidebar();
 
   v.head = h('header', { class: 'main-head' });
   v.list = h('div', { class: 'messages', role: 'log' });
   v.composer = renderComposer(v);
-  els.main.replaceChildren(v.head, v.list, v.composer);
+  v.threadEl = h('aside', { class: 'thread', 'aria-label': 'Fil de discussion' });
+  v.wrap = h('div', { class: 'channel-wrap' }, h('div', { class: 'channel-col' }, v.list, v.composer), v.threadEl);
+  els.main.replaceChildren(v.head, v.wrap);
   renderChannelHeader(v);
   renderMessages(v);
   await reloadMessages(v);
-  v.composer.querySelector('textarea')?.focus();
+  if (threadId) openThread(v, threadId);
+  else v.composer.querySelector('textarea')?.focus();
 }
 
 async function reloadMessages(v) {
@@ -473,6 +515,7 @@ async function reloadMessages(v) {
     v.loading = false;
     renderMessages(v);
     markRead(v);
+    if (v.thread) loadThread(v, v.thread);
   } catch (err) {
     report(err);
   }
@@ -544,6 +587,75 @@ async function leaveChannel(c) {
   } catch (err) { report(err); }
 }
 
+// --- Mise à jour des messages affichés (canal + fil ouvert) ---------------------
+
+function rerender(v) {
+  renderMessages(v, { keepScroll: true });
+  if (v.thread?.replies) renderThread(v, { keepScroll: true });
+}
+
+function addReply(v, m) {
+  if (v.seen.has(m.id)) return;
+  v.seen.add(m.id);
+  const root = v.messages.find((x) => x.id === m.parentId);
+  if (root) {
+    root.replyCount += 1;
+    root.lastReplyAt = m.createdAt;
+    renderMessages(v, { keepScroll: true });
+  }
+  const t = v.thread;
+  if (t?.rootId === m.parentId && t.replies) {
+    t.replies.push(m);
+    t.root.replyCount += 1;
+    renderThread(v);
+  }
+}
+
+function replaceMessage(v, message) {
+  const swap = (m) => (m.id === message.id ? { ...message, replyCount: m.replyCount, lastReplyAt: m.lastReplyAt } : m);
+  v.messages = v.messages.map(swap);
+  const t = v.thread;
+  if (t?.replies) {
+    t.root = swap(t.root);
+    t.replies = t.replies.map(swap);
+  }
+  rerender(v);
+}
+
+function removeMessage(v, id, parentId) {
+  v.messages = v.messages.filter((m) => m.id !== id);
+  if (parentId) {
+    const root = v.messages.find((m) => m.id === parentId);
+    if (root) root.replyCount = Math.max(0, root.replyCount - 1);
+  }
+  const t = v.thread;
+  if (t?.rootId === id) {
+    toast('Le message d’origine de ce fil a été supprimé.', 'info');
+    location.hash = `#/c/${v.id}`;
+  } else if (t?.replies && parentId === t.rootId) {
+    t.replies = t.replies.filter((m) => m.id !== id);
+    t.root.replyCount = Math.max(0, t.root.replyCount - 1);
+  }
+  rerender(v);
+}
+
+// --- Liste des messages ---------------------------------------------------
+
+function messageNodes(v, messages, { inThread = false } = {}) {
+  const nodes = [];
+  let prev = null;
+  for (const m of messages) {
+    if (!inThread && (!prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString())) {
+      nodes.push(h('div', { class: 'day' }, h('span', {}, dayLabel(m.createdAt))));
+      prev = null;
+    }
+    const grouped = prev && prev.userId === m.userId && m.createdAt - prev.createdAt < 5 * 60_000 && !prev.replyCount;
+    nodes.push(renderMessage(v, m, { grouped, inThread }));
+    prev = m;
+  }
+  return nodes;
+}
+
 function renderMessages(v, { keepScroll = false } = {}) {
   const list = v.list;
   const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
@@ -556,17 +668,7 @@ function renderMessages(v, { keepScroll = false } = {}) {
       h('h2', {}, c.isDm ? `Votre conversation avec ${userName(c.dmUserId)}` : `Bienvenue dans #${c.name}`),
       h('p', { class: 'muted' }, 'Aucun message pour l’instant. Lancez la discussion !')));
   }
-
-  let prev = null;
-  for (const m of v.messages) {
-    if (!prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()) {
-      nodes.push(h('div', { class: 'day' }, h('span', {}, dayLabel(m.createdAt))));
-      prev = null;
-    }
-    const grouped = prev && prev.userId === m.userId && m.createdAt - prev.createdAt < 5 * 60_000;
-    nodes.push(renderMessage(v, m, grouped));
-    prev = m;
-  }
+  nodes.push(...messageNodes(v, v.messages));
   list.replaceChildren(...nodes);
   if (!keepScroll && (atBottom || !v.scrolled)) {
     list.scrollTop = list.scrollHeight;
@@ -574,22 +676,48 @@ function renderMessages(v, { keepScroll = false } = {}) {
   }
 }
 
-function renderMessage(v, m, grouped) {
+const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
+function fileIcon(a) {
+  if (a.mime.startsWith('image/')) return '🖼';
+  if (a.mime === 'application/pdf') return '📕';
+  if (/sheet|excel|csv/.test(a.mime)) return '📊';
+  if (/word|document|text/.test(a.mime)) return '📝';
+  if (/zip|compressed|tar/.test(a.mime)) return '🗜';
+  return '📎';
+}
+
+function renderAttachments(list) {
+  if (!list?.length) return null;
+  return h('div', { class: 'attachments' }, list.map((a) => {
+    const url = `/api/attachments/${a.id}`;
+    return INLINE_IMAGES.has(a.mime)
+      ? h('a', { class: 'att-image', href: url, target: '_blank', rel: 'noopener', title: a.name },
+        h('img', { src: url, alt: a.name, loading: 'lazy' }))
+      : h('a', { class: 'att-file', href: url, download: a.name, title: `Télécharger ${a.name}` },
+        h('span', { class: 'att-icon', 'aria-hidden': 'true' }, fileIcon(a)),
+        h('span', { class: 'att-info' }, h('strong', {}, a.name), h('span', { class: 'muted small' }, formatSize(a.size))));
+  }));
+}
+
+function renderMessage(v, m, { grouped = false, inThread = false } = {}) {
   const mine = m.userId === state.me.id;
   const canDelete = mine || state.me.role === 'admin';
+  const canReply = !inThread && !m.parentId;
+  const editing = v.editingId === m.id;
   let body;
-  if (v.editingId === m.id) {
+  if (editing) {
     const input = h('textarea', { class: 'edit-input', value: m.body, rows: 2 });
     const save = async () => {
       const text = input.value.trim();
-      if (!text) return;
+      if (!text && !m.attachments.length) return;
       try {
         await api('PATCH', `/messages/${m.id}`, { body: text });
         v.editingId = null;
-        renderMessages(v, { keepScroll: true });
+        rerender(v);
       } catch (err) { report(err); }
     };
-    const cancel = () => { v.editingId = null; renderMessages(v, { keepScroll: true }); };
+    const cancel = () => { v.editingId = null; rerender(v); };
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
       if (e.key === 'Escape') cancel();
@@ -599,62 +727,202 @@ function renderMessage(v, m, grouped) {
         h('button', { class: 'btn small', onclick: cancel }, 'Annuler'),
         h('button', { class: 'btn small primary', onclick: save }, 'Enregistrer')));
     queueMicrotask(() => { input.focus(); input.setSelectionRange(input.value.length, input.value.length); });
-  } else {
+  } else if (m.body) {
     body = h('div', { class: 'md', html: renderMarkdown(m.body) });
   }
 
-  return h('article', { class: `message${grouped ? ' grouped' : ''}` },
+  const openIt = () => { location.hash = `#/c/${v.id}/t/${m.id}`; };
+  const replies = !inThread && m.replyCount > 0 && h('button', { class: 'thread-link', onclick: openIt },
+    h('strong', {}, `${m.replyCount} réponse${m.replyCount > 1 ? 's' : ''}`),
+    m.lastReplyAt && h('span', { class: 'muted' }, ` · dernière ${relativeTime(m.lastReplyAt)}`));
+
+  const actions = !editing && [
+    canReply && h('button', { class: 'icon-btn', title: 'Répondre dans un fil', 'aria-label': 'Répondre dans un fil', onclick: openIt }, '💬'),
+    mine && h('button', { class: 'icon-btn', title: 'Modifier', 'aria-label': 'Modifier', onclick: () => { v.editingId = m.id; rerender(v); } }, '✎'),
+    canDelete && h('button', { class: 'icon-btn', title: 'Supprimer', 'aria-label': 'Supprimer', onclick: () => deleteMessage(m) }, '🗑'),
+  ].filter(Boolean);
+
+  return h('article', { class: `message${grouped ? ' grouped' : ''}${v.thread?.rootId === m.id && !inThread ? ' highlighted' : ''}` },
     grouped ? h('span', { class: 'gutter-time muted' }, timeFmt.format(m.createdAt)) : avatar(m.userId),
     h('div', { class: 'message-body' },
       !grouped && h('div', { class: 'message-meta' },
         h('strong', {}, userName(m.userId)),
         h('time', { class: 'muted small', datetime: new Date(m.createdAt).toISOString(), title: dateTimeFmt.format(m.createdAt) }, timeFmt.format(m.createdAt))),
       body,
-      m.editedAt && v.editingId !== m.id && h('span', { class: 'muted small' }, '(modifié)')),
-    v.editingId !== m.id && (mine || canDelete) && h('div', { class: 'message-actions' },
-      mine && h('button', { class: 'icon-btn', title: 'Modifier', 'aria-label': 'Modifier', onclick: () => { v.editingId = m.id; renderMessages(v, { keepScroll: true }); } }, '✎'),
-      canDelete && h('button', { class: 'icon-btn', title: 'Supprimer', 'aria-label': 'Supprimer', onclick: () => deleteMessage(m) }, '🗑')));
+      !editing && renderAttachments(m.attachments),
+      m.editedAt && !editing && h('span', { class: 'muted small' }, '(modifié)'),
+      replies),
+    actions?.length > 0 && h('div', { class: 'message-actions' }, actions));
 }
 
 async function deleteMessage(m) {
-  if (!confirm('Supprimer ce message ?')) return;
+  const extra = m.replyCount ? ` Ses ${m.replyCount} réponse${m.replyCount > 1 ? 's' : ''} seront aussi supprimées.` : '';
+  if (!confirm(`Supprimer ce message ?${extra}`)) return;
   try { await api('DELETE', `/messages/${m.id}`); } catch (err) { report(err); }
 }
 
-function renderComposer(v) {
+// --- Fils de discussion ------------------------------------------------------
+
+function showThread(v, threadId) {
+  if (!threadId) closeThread(v);
+  else if (v.thread?.rootId !== threadId) openThread(v, threadId);
+}
+
+function openThread(v, rootId) {
+  const t = { rootId, root: null, replies: null };
+  v.thread = t;
+  t.list = h('div', { class: 'thread-list' }, h('p', { class: 'muted center' }, 'Chargement…'));
+  t.composer = renderComposer(v, { parentId: rootId });
   const c = state.channels.get(v.id);
+  v.threadEl.replaceChildren(
+    h('header', { class: 'thread-head' },
+      h('div', {}, h('h2', {}, 'Fil de discussion'), h('span', { class: 'muted small' }, channelTitle(c))),
+      h('button', { class: 'icon-btn', 'aria-label': 'Fermer le fil', title: 'Fermer', onclick: () => { location.hash = `#/c/${v.id}`; } }, '×')),
+    t.list,
+    t.composer);
+  v.wrap.classList.add('with-thread');
+  renderMessages(v, { keepScroll: true });
+  loadThread(v, t);
+}
+
+async function loadThread(v, t) {
+  try {
+    const { message, replies } = await api('GET', `/messages/${t.rootId}/replies`);
+    if (v.thread !== t) return;
+    t.root = message;
+    t.replies = replies;
+    for (const r of replies) v.seen.add(r.id);
+    renderThread(v);
+    t.composer.querySelector('textarea')?.focus();
+  } catch (err) {
+    if (v.thread !== t) return;
+    report(err);
+    location.hash = `#/c/${v.id}`;
+  }
+}
+
+function closeThread(v) {
+  if (!v.thread) return;
+  v.thread = null;
+  v.wrap.classList.remove('with-thread');
+  v.threadEl.replaceChildren();
+  renderMessages(v, { keepScroll: true });
+}
+
+function renderThread(v, { keepScroll = false } = {}) {
+  const t = v.thread;
+  const list = t.list;
+  const atBottom = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
+  const count = t.replies.length;
+  list.replaceChildren(
+    renderMessage(v, t.root, { inThread: true }),
+    h('div', { class: 'day' }, h('span', {}, count ? `${count} réponse${count > 1 ? 's' : ''}` : 'Aucune réponse')),
+    ...messageNodes(v, t.replies, { inThread: true }));
+  if (!keepScroll && (atBottom || !t.scrolled)) {
+    list.scrollTop = list.scrollHeight;
+    t.scrolled = true;
+  }
+}
+
+// --- Zone de saisie (canal ou fil), avec pièces jointes ------------------------
+
+function renderComposer(v, { parentId = null } = {}) {
+  const c = state.channels.get(v.id);
+  const pending = []; // { file, id, status: 'uploading' | 'done' | 'error' }
+  const chips = h('div', { class: 'chips' });
   const input = h('textarea', {
     rows: 1,
-    placeholder: `Écrire ${c.isDm ? `à ${userName(c.dmUserId)}` : `dans #${c.name}`}`,
-    'aria-label': 'Message',
+    placeholder: parentId ? 'Répondre dans le fil…' : `Écrire ${c.isDm ? `à ${userName(c.dmUserId)}` : `dans #${c.name}`}`,
+    'aria-label': parentId ? 'Réponse' : 'Message',
   });
+  const fileInput = h('input', {
+    type: 'file', multiple: true, hidden: true,
+    onchange: (e) => { addFiles(e.target.files); e.target.value = ''; },
+  });
+
   const autosize = () => {
     input.style.height = 'auto';
     input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
   };
+
+  function renderChips() {
+    chips.replaceChildren(...pending.map((item) => h('div', { class: `chip ${item.status}` },
+      h('span', { class: 'att-icon', 'aria-hidden': 'true' }, fileIcon({ mime: item.file.type || '' })),
+      h('span', { class: 'chip-name' }, item.file.name),
+      h('span', { class: 'muted small' }, item.status === 'uploading' ? 'envoi…' : item.status === 'error' ? 'échec' : formatSize(item.file.size)),
+      h('button', {
+        type: 'button', class: 'icon-btn', 'aria-label': `Retirer ${item.file.name}`,
+        onclick: () => { pending.splice(pending.indexOf(item), 1); renderChips(); },
+      }, '×'))));
+    chips.hidden = pending.length === 0;
+  }
+
+  async function addFiles(files) {
+    for (const file of files) {
+      if (pending.length >= state.limits.maxAttachments) {
+        toast(`${state.limits.maxAttachments} fichiers maximum par message.`);
+        break;
+      }
+      if (file.size > state.limits.maxUploadBytes) {
+        toast(`« ${file.name} » est trop volumineux (${formatSize(state.limits.maxUploadBytes)} maximum).`);
+        continue;
+      }
+      if (file.size === 0) {
+        toast(`« ${file.name} » est vide.`);
+        continue;
+      }
+      const item = { file, status: 'uploading' };
+      pending.push(item);
+      uploadFile(v.id, file)
+        .then(({ attachment }) => { item.id = attachment.id; item.status = 'done'; })
+        .catch((err) => { item.status = 'error'; report(err); })
+        .finally(renderChips);
+    }
+    renderChips();
+    input.focus();
+  }
+
   const send = async () => {
     const text = input.value.trim();
-    if (!text) return;
+    if (pending.some((p) => p.status === 'uploading')) {
+      toast('Patientez, les fichiers sont en cours d’envoi.', 'info');
+      return;
+    }
+    const files = pending.filter((p) => p.status === 'done');
+    if (!text && !files.length) return;
+    const sent = pending.splice(0);
     input.value = '';
     autosize();
+    renderChips();
     try {
-      const { message } = await api('POST', `/channels/${v.id}/messages`, { body: text });
+      const { message } = await api('POST', `/channels/${v.id}/messages`, {
+        body: text, parentId, attachmentIds: files.map((p) => p.id),
+      });
       if (!c.joined) {
         c.joined = true;
         renderSidebar();
         renderChannelHeader(v);
       }
-      if (state.view === v && !v.messages.some((x) => x.id === message.id)) {
-        v.messages.push(message);
-        renderMessages(v);
+      if (state.view !== v) return;
+      if (parentId) {
+        addReply(v, message);
+        v.thread?.list && (v.thread.list.scrollTop = v.thread.list.scrollHeight);
+      } else {
+        if (!v.messages.some((x) => x.id === message.id)) {
+          v.messages.push(message);
+          renderMessages(v);
+        }
+        v.list.scrollTop = v.list.scrollHeight;
       }
-      v.list.scrollTop = v.list.scrollHeight;
     } catch (err) {
       input.value = text;
+      pending.push(...sent);
       autosize();
+      renderChips();
       report(err);
     }
   };
+
   input.addEventListener('input', autosize);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -662,10 +930,42 @@ function renderComposer(v) {
       send();
     }
   });
-  return h('form', { class: 'composer', onsubmit: (e) => { e.preventDefault(); send(); } },
-    input,
-    h('button', { class: 'btn primary', type: 'submit' }, 'Envoyer'),
-    h('p', { class: 'muted small hint' }, '**gras**, *italique*, `code`, - liste · Entrée pour envoyer, Maj+Entrée pour une nouvelle ligne'));
+  input.addEventListener('paste', (e) => {
+    if (e.clipboardData?.files.length) {
+      e.preventDefault();
+      addFiles(e.clipboardData.files);
+    }
+  });
+
+  const form = h('form', { class: `composer${parentId ? ' in-thread' : ''}`, onsubmit: (e) => { e.preventDefault(); send(); } },
+    chips,
+    h('div', { class: 'composer-row' },
+      h('button', {
+        type: 'button', class: 'icon-btn attach', title: 'Joindre des fichiers', 'aria-label': 'Joindre des fichiers',
+        onclick: () => fileInput.click(),
+      }, '📎'),
+      input,
+      h('button', { class: 'btn primary', type: 'submit' }, 'Envoyer')),
+    !parentId && h('p', { class: 'muted small hint' }, '**gras**, *italique*, `code`, - liste · Entrée pour envoyer, Maj+Entrée pour une nouvelle ligne · glissez un fichier pour le joindre'),
+    fileInput);
+  renderChips();
+
+  // Glisser-déposer de fichiers sur la zone de saisie.
+  form.addEventListener('dragover', (e) => {
+    if (![...e.dataTransfer.types].includes('Files')) return;
+    e.preventDefault();
+    form.classList.add('dragging');
+  });
+  form.addEventListener('dragleave', (e) => {
+    if (!form.contains(e.relatedTarget)) form.classList.remove('dragging');
+  });
+  form.addEventListener('drop', (e) => {
+    if (!e.dataTransfer.files.length) return;
+    e.preventDefault();
+    form.classList.remove('dragging');
+    addFiles(e.dataTransfer.files);
+  });
+  return form;
 }
 
 // --- Fenêtres ----------------------------------------------------------------
@@ -995,7 +1295,7 @@ async function openSearch(term) {
         h('strong', {}, '📄 ', pageTitle(p)), h('p', { class: 'muted small' }, p.excerpt)))),
       messages.length > 0 && h('section', {}, h('h2', {}, 'Messages'), messages.map((m) => {
         const c = state.channels.get(m.channelId);
-        return h('a', { class: 'result', href: `#/c/${m.channelId}` },
+        return h('a', { class: 'result', href: m.parentId ? `#/c/${m.channelId}/t/${m.parentId}` : `#/c/${m.channelId}` },
           h('div', { class: 'small' }, h('strong', {}, userName(m.userId)), ' dans ', c ? channelTitle(c) : 'un canal',
             ' · ', h('span', { class: 'muted' }, dateTimeFmt.format(m.createdAt))),
           h('div', { class: 'md', html: renderMarkdown(m.body) }));

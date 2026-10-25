@@ -47,11 +47,26 @@ CREATE TABLE IF NOT EXISTS messages (
   id         INTEGER PRIMARY KEY,
   channel_id INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
   user_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  parent_id  INTEGER REFERENCES messages(id) ON DELETE CASCADE,
   body       TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   edited_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS messages_channel ON messages(channel_id, id);
+
+-- Un fichier est d'abord envoyé seul (message_id NULL), puis rattaché au message qui le publie.
+CREATE TABLE IF NOT EXISTS attachments (
+  id          INTEGER PRIMARY KEY,
+  message_id  INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+  channel_id  INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+  user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  name        TEXT NOT NULL,
+  mime        TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  storage_key TEXT NOT NULL UNIQUE,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id);
 
 CREATE TABLE IF NOT EXISTS pages (
   id         INTEGER PRIMARY KEY,
@@ -72,7 +87,17 @@ export function openDb(file = ':memory:') {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+// Met à niveau les bases créées par une version précédente.
+function migrate(db) {
+  const columns = db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name);
+  if (!columns.includes('parent_id')) {
+    db.exec('ALTER TABLE messages ADD COLUMN parent_id INTEGER REFERENCES messages(id) ON DELETE CASCADE');
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS messages_parent ON messages(parent_id)');
 }
 
 export function transaction(db, fn) {
