@@ -48,7 +48,7 @@ Ouvrez http://localhost:3000, créez le compte administrateur, puis invitez vos 
 | `MAX_UPLOAD_MB` | `20`              | Taille maximale d'une pièce jointe, en Mo                   |
 | `TRUST_PROXY` | non défini          | À définir (ex. `1`) derrière un reverse proxy HTTPS         |
 
-La base et le dossier des pièces jointes sont mis à niveau automatiquement au démarrage quand une nouvelle version ajoute des fonctionnalités.
+La base de données est mise à niveau automatiquement au démarrage quand une nouvelle version ajoute des fonctionnalités.
 
 En production, placez l'application derrière un reverse proxy HTTPS (Caddy, Nginx…) qui transmet aussi les WebSocket sur `/ws`.
 
