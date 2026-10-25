@@ -12,7 +12,9 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 - **Fils de discussion** : répondre à un message sans encombrer le canal, compteur de réponses en direct
 - **Pièces jointes** : bouton trombone, glisser-déposer ou copier-coller ; aperçu des images, téléchargement des autres fichiers (10 par message, 20 Mo chacun par défaut)
 - Modification / suppression de ses messages (les admins peuvent supprimer)
-- Mise en forme Markdown : **gras**, *italique*, `code`, listes, liens, @mentions
+- **Réactions emoji** : pastilles cliquables sous les messages, sélecteur d'emojis
+- **@mentions** avec autocomplétion (`@Prénom Nom`, ou `@tous` pour prévenir tout le canal)
+- Mise en forme Markdown : **gras**, *italique*, `code`, listes, liens
 - Historique paginé
 
 **Pages**
@@ -21,6 +23,12 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 - Enregistrement automatique
 - Gestion des conflits : si deux personnes modifient la même page, personne n'écrase le travail de l'autre
 - Mise à jour en direct quand un collègue modifie la page ouverte
+
+**Notifications**
+- Onglet **Activité** avec badge : mentions, réponses dans les fils auxquels on participe, réactions à ses messages
+- Une notification déjà sous les yeux (canal ou fil ouvert) est marquée comme lue automatiquement
+- Notifications du bureau (optionnelles) quand l'onglet est en arrière-plan, y compris pour les messages privés
+- Le nombre total de non-lus s'affiche dans le titre de l'onglet
 
 **Commun**
 - Comptes avec invitations : le premier inscrit devient administrateur, les suivants rejoignent via un lien d'invitation (usage unique, valable 7 jours)
@@ -85,10 +93,10 @@ test/
 
 ## Pistes pour la suite
 
-- Réactions emoji sur les messages
-- Notification quand quelqu'un répond dans un fil auquel on participe
 - Pièces jointes dans les pages
-- Notifications navigateur et email
+- Notifications par email (résumé des mentions non lues)
+- Notifications push sur mobile (application installable / service worker)
+- Préférences de notification par canal (muet, mentions uniquement)
 - Canaux privés à plusieurs, gestion des membres et des rôles par l'admin
 - Éditeur de pages par blocs (WYSIWYG) et historique des versions
 - Réinitialisation de mot de passe par email

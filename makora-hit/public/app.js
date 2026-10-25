@@ -104,11 +104,20 @@ const state = {
   pages: new Map(),
   view: null,
   expanded: new Set(storage.get('makora.expanded', [])),
+  notifications: [],
+  notifUnread: 0,
 };
 
 const userName = (id) => state.users.get(id)?.name ?? 'Utilisateur supprimé';
 const channelTitle = (c) => (c.isDm ? userName(c.dmUserId) : `# ${c.name}`);
 const pageTitle = (p) => p?.title?.trim() || 'Sans titre';
+const EVERYONE = 'tous';
+
+// Rendu Markdown des messages, avec mise en évidence des @mentions connues.
+const md = (text) => renderMarkdown(text, {
+  mentions: [...[...state.users.values()].map((u) => u.name), EVERYONE],
+  me: state.me.name,
+});
 
 function avatar(userId, size = '') {
   const name = userName(userId);
@@ -199,13 +208,15 @@ async function showAuth() {
 }
 
 async function startApp() {
-  const [{ users, online }, { channels }, { pages }] = await Promise.all([
-    api('GET', '/users'), api('GET', '/channels'), api('GET', '/pages'),
+  const [{ users, online }, { channels }, { pages }, activity] = await Promise.all([
+    api('GET', '/users'), api('GET', '/channels'), api('GET', '/pages'), api('GET', '/notifications'),
   ]);
   state.users = new Map(users.map((u) => [u.id, u]));
   state.online = new Set(online);
   state.channels = new Map(channels.map((c) => [c.id, c]));
   state.pages = new Map(pages.map((p) => [p.id, p]));
+  state.notifications = activity.notifications;
+  state.notifUnread = activity.unread;
   renderShell();
   connect();
   window.addEventListener('hashchange', route);
@@ -243,15 +254,18 @@ function connect() {
 // Après une coupure, on recharge ce qui a pu changer pendant qu'on était hors ligne.
 async function resync() {
   try {
-    const [{ users }, { channels }, { pages }] = await Promise.all([
-      api('GET', '/users'), api('GET', '/channels'), api('GET', '/pages'),
+    const [{ users }, { channels }, { pages }, activity] = await Promise.all([
+      api('GET', '/users'), api('GET', '/channels'), api('GET', '/pages'), api('GET', '/notifications'),
     ]);
     state.users = new Map(users.map((u) => [u.id, u]));
     state.channels = new Map(channels.map((c) => [c.id, c]));
     state.pages = new Map(pages.map((p) => [p.id, p]));
+    state.notifications = activity.notifications;
+    state.notifUnread = activity.unread;
     renderSidebar();
     const v = state.view;
     if (v?.kind === 'channel') reloadMessages(v);
+    if (v?.kind === 'activity') renderActivity(v);
   } catch (err) {
     if (err.status === 401) location.reload();
   }
@@ -279,6 +293,9 @@ function onEvent(ev) {
         resync();
         break;
       }
+      if (channel.isDm && m.userId !== state.me.id) {
+        desktopNotify(userName(m.userId), m.body || '📎 Pièce jointe', m.parentId ? `#/c/${m.channelId}/t/${m.parentId}` : `#/c/${m.channelId}`);
+      }
       if (m.parentId) {
         if (v?.kind === 'channel' && v.id === m.channelId) addReply(v, m);
       } else if (v?.kind === 'channel' && v.id === m.channelId) {
@@ -297,6 +314,13 @@ function onEvent(ev) {
         if (ev.type === 'message:deleted') removeMessage(v, ev.messageId, ev.parentId);
         else replaceMessage(v, ev.message);
       }
+      if (ev.type === 'message:deleted') forgetNotifications(ev.messageId);
+      break;
+    case 'message:reactions':
+      if (v?.kind === 'channel' && v.id === ev.channelId) applyReactions(v, ev.messageId, ev.reactions);
+      break;
+    case 'notification:new':
+      onNotification(ev.notification);
       break;
     case 'page:changed':
       state.pages.set(ev.page.id, ev.page);
@@ -351,6 +375,7 @@ function renderShell() {
         },
       }, search),
       h('nav', { class: 'nav' },
+        els.activity = h('div', { class: 'nav-top' }),
         section('Canaux', els.channels, openChannelDialog, 'Créer ou rejoindre un canal'),
         section('Messages privés', els.dms, openDmDialog, 'Nouveau message privé'),
         section('Pages', els.pages, () => createPage(null), 'Nouvelle page')),
@@ -412,7 +437,11 @@ function renderSidebar() {
   els.pages.replaceChildren(...branch(null, 0));
   if (!els.pages.children.length) els.pages.append(h('li', { class: 'muted small empty' }, 'Aucune page'));
 
-  const unread = all.reduce((n, c) => n + (c.joined ? c.unread : 0), 0);
+  els.activity.replaceChildren(h('a', { href: '#/activity', class: `nav-item${v?.kind === 'activity' ? ' active' : ''}${state.notifUnread ? ' unread' : ''}` },
+    h('span', { class: 'label' }, h('span', { 'aria-hidden': 'true' }, '🔔'), 'Activité'),
+    state.notifUnread > 0 && h('span', { class: 'badge' }, state.notifUnread > 99 ? '99+' : state.notifUnread)));
+
+  const unread = all.reduce((n, c) => n + (c.joined ? c.unread : 0), 0) + state.notifUnread;
   document.title = `${unread ? `(${unread}) ` : ''}MAKORA HIT`;
 }
 
@@ -459,6 +488,7 @@ function route() {
   }
   else if ((m = hash.match(/^#\/p\/(\d+)$/))) openPage(Number(m[1]));
   else if ((m = hash.match(/^#\/search\/(.+)$/))) openSearch(decodeURIComponent(m[1]));
+  else if (hash === '#/activity') openActivity();
   else {
     const home = [...state.channels.values()].find((c) => c.name === 'general' && c.joined)
       ?? [...state.channels.values()].find((c) => c.joined);
@@ -515,6 +545,7 @@ async function reloadMessages(v) {
     v.loading = false;
     renderMessages(v);
     markRead(v);
+    readNotificationsWhere((n) => n.channelId === v.id && !n.parentId);
     if (v.thread) loadThread(v, v.thread);
   } catch (err) {
     report(err);
@@ -604,10 +635,14 @@ function addReply(v, m) {
     renderMessages(v, { keepScroll: true });
   }
   const t = v.thread;
-  if (t?.rootId === m.parentId && t.replies) {
+  if (t?.rootId !== m.parentId) return;
+  if (t.replies) {
     t.replies.push(m);
     t.root.replyCount += 1;
     renderThread(v);
+  } else {
+    // Le fil est encore en cours de chargement : on garde la réponse pour ne pas la perdre.
+    t.early.push(m);
   }
 }
 
@@ -728,7 +763,7 @@ function renderMessage(v, m, { grouped = false, inThread = false } = {}) {
         h('button', { class: 'btn small primary', onclick: save }, 'Enregistrer')));
     queueMicrotask(() => { input.focus(); input.setSelectionRange(input.value.length, input.value.length); });
   } else if (m.body) {
-    body = h('div', { class: 'md', html: renderMarkdown(m.body) });
+    body = h('div', { class: 'md', html: md(m.body) });
   }
 
   const openIt = () => { location.hash = `#/c/${v.id}/t/${m.id}`; };
@@ -736,7 +771,21 @@ function renderMessage(v, m, { grouped = false, inThread = false } = {}) {
     h('strong', {}, `${m.replyCount} réponse${m.replyCount > 1 ? 's' : ''}`),
     m.lastReplyAt && h('span', { class: 'muted' }, ` · dernière ${relativeTime(m.lastReplyAt)}`));
 
+  const pick = (e) => openEmojiPicker(e.currentTarget, (emoji) => toggleReaction(m, emoji));
+  const reactions = !editing && m.reactions?.length > 0 && h('div', { class: 'reactions' },
+    m.reactions.map((r) => {
+      const reacted = r.userIds.includes(state.me.id);
+      return h('button', {
+        class: `reaction${reacted ? ' mine' : ''}`,
+        title: `${r.userIds.map(userName).join(', ')} : ${r.emoji}`,
+        'aria-pressed': reacted ? 'true' : 'false',
+        onclick: () => toggleReaction(m, r.emoji),
+      }, h('span', { class: 'reaction-emoji' }, r.emoji), h('span', {}, r.userIds.length));
+    }),
+    h('button', { class: 'reaction add', title: 'Ajouter une réaction', 'aria-label': 'Ajouter une réaction', onclick: pick }, '+'));
+
   const actions = !editing && [
+    h('button', { class: 'icon-btn', title: 'Réagir', 'aria-label': 'Réagir', onclick: pick }, '😊'),
     canReply && h('button', { class: 'icon-btn', title: 'Répondre dans un fil', 'aria-label': 'Répondre dans un fil', onclick: openIt }, '💬'),
     mine && h('button', { class: 'icon-btn', title: 'Modifier', 'aria-label': 'Modifier', onclick: () => { v.editingId = m.id; rerender(v); } }, '✎'),
     canDelete && h('button', { class: 'icon-btn', title: 'Supprimer', 'aria-label': 'Supprimer', onclick: () => deleteMessage(m) }, '🗑'),
@@ -751,6 +800,7 @@ function renderMessage(v, m, { grouped = false, inThread = false } = {}) {
       body,
       !editing && renderAttachments(m.attachments),
       m.editedAt && !editing && h('span', { class: 'muted small' }, '(modifié)'),
+      reactions,
       replies),
     actions?.length > 0 && h('div', { class: 'message-actions' }, actions));
 }
@@ -769,7 +819,7 @@ function showThread(v, threadId) {
 }
 
 function openThread(v, rootId) {
-  const t = { rootId, root: null, replies: null };
+  const t = { rootId, root: null, replies: null, early: [] };
   v.thread = t;
   t.list = h('div', { class: 'thread-list' }, h('p', { class: 'muted center' }, 'Chargement…'));
   t.composer = renderComposer(v, { parentId: rootId });
@@ -789,10 +839,12 @@ async function loadThread(v, t) {
   try {
     const { message, replies } = await api('GET', `/messages/${t.rootId}/replies`);
     if (v.thread !== t) return;
-    t.root = message;
-    t.replies = replies;
+    const missing = t.early.filter((m) => !replies.some((r) => r.id === m.id));
+    t.root = { ...message, replyCount: message.replyCount + missing.length };
+    t.replies = [...replies, ...missing].sort((x, y) => x.id - y.id);
     for (const r of replies) v.seen.add(r.id);
     renderThread(v);
+    readNotificationsWhere((n) => n.parentId === t.rootId || n.messageId === t.rootId);
     t.composer.querySelector('textarea')?.focus();
   } catch (err) {
     if (v.thread !== t) return;
@@ -844,6 +896,7 @@ function renderComposer(v, { parentId = null } = {}) {
     input.style.height = 'auto';
     input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
   };
+  const mentions = mentionPicker(input);
 
   function renderChips() {
     chips.replaceChildren(...pending.map((item) => h('div', { class: `chip ${item.status}` },
@@ -923,8 +976,9 @@ function renderComposer(v, { parentId = null } = {}) {
     }
   };
 
-  input.addEventListener('input', autosize);
+  input.addEventListener('input', () => { autosize(); mentions.update(); });
   input.addEventListener('keydown', (e) => {
+    if (mentions.handleKey(e)) return;
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
@@ -939,6 +993,7 @@ function renderComposer(v, { parentId = null } = {}) {
 
   const form = h('form', { class: `composer${parentId ? ' in-thread' : ''}`, onsubmit: (e) => { e.preventDefault(); send(); } },
     chips,
+    mentions.el,
     h('div', { class: 'composer-row' },
       h('button', {
         type: 'button', class: 'icon-btn attach', title: 'Joindre des fichiers', 'aria-label': 'Joindre des fichiers',
@@ -1273,6 +1328,282 @@ window.addEventListener('beforeunload', (e) => {
   }
 });
 
+// --- Réactions ------------------------------------------------------------------
+
+const QUICK_EMOJIS = ['👍', '❤️', '😂', '🎉', '🙏', '👀', '✅', '🔥', '😮', '😢', '👏', '🚀', '💡', '🤔', '👌', '☕'];
+
+function applyReactions(v, messageId, reactions) {
+  const update = (m) => (m && m.id === messageId ? { ...m, reactions } : m);
+  v.messages = v.messages.map(update);
+  if (v.thread?.replies) {
+    v.thread.root = update(v.thread.root);
+    v.thread.replies = v.thread.replies.map(update);
+  }
+  rerender(v);
+}
+
+async function toggleReaction(m, emoji) {
+  try {
+    const { reactions } = await api('POST', `/messages/${m.id}/reactions`, { emoji });
+    if (state.view?.kind === 'channel' && state.view.id === m.channelId) applyReactions(state.view, m.id, reactions);
+  } catch (err) { report(err); }
+}
+
+let closePicker = () => {};
+
+function openEmojiPicker(anchor, onPick) {
+  closePicker();
+  const picker = h('div', { class: 'emoji-picker', role: 'dialog', 'aria-label': 'Choisir une réaction' },
+    QUICK_EMOJIS.map((emoji) => h('button', {
+      type: 'button', class: 'emoji', 'aria-label': emoji,
+      onclick: () => { closePicker(); onPick(emoji); },
+    }, emoji)));
+  document.body.append(picker);
+
+  const r = anchor.getBoundingClientRect();
+  const { offsetWidth: w, offsetHeight: ph } = picker;
+  const top = r.bottom + ph + 8 > innerHeight ? r.top - ph - 4 : r.bottom + 4;
+  picker.style.top = `${Math.max(8, top)}px`;
+  picker.style.left = `${Math.min(Math.max(8, r.left), innerWidth - w - 8)}px`;
+  picker.querySelector('button').focus();
+
+  const outside = (e) => { if (!picker.contains(e.target)) closePicker(); };
+  const onKey = (e) => { if (e.key === 'Escape') { closePicker(); anchor.focus(); } };
+  closePicker = () => {
+    picker.remove();
+    document.removeEventListener('pointerdown', outside, true);
+    document.removeEventListener('keydown', onKey);
+    closePicker = () => {};
+  };
+  document.addEventListener('pointerdown', outside, true);
+  document.addEventListener('keydown', onKey);
+}
+
+// --- Autocomplétion des @mentions ------------------------------------------------
+
+function mentionPicker(input) {
+  const el = h('ul', { class: 'mention-picker', role: 'listbox', hidden: true });
+  let items = [];
+  let index = 0;
+  let start = -1;
+
+  function candidates(query) {
+    const q = query.toLowerCase();
+    const people = [...state.users.values()]
+      .filter((u) => u.id !== state.me.id)
+      .filter((u) => u.name.toLowerCase().startsWith(q) || u.name.toLowerCase().split(/\s+/).some((w) => w.startsWith(q)))
+      .slice(0, 6)
+      .map((u) => ({ value: u.name, label: u.name, id: u.id }));
+    if (EVERYONE.startsWith(q)) people.push({ value: EVERYONE, label: '@tous', hint: 'prévenir tout le canal' });
+    return people;
+  }
+
+  function hide() {
+    el.hidden = true;
+    items = [];
+  }
+
+  function render() {
+    el.replaceChildren(...items.map((item, i) => h('li', {
+      role: 'option', class: i === index ? 'active' : '', 'aria-selected': i === index ? 'true' : 'false',
+      onpointerdown: (e) => { e.preventDefault(); choose(i); },
+    },
+    item.id ? avatar(item.id, 'tiny') : h('span', { class: 'avatar tiny' }, '@'),
+    h('span', {}, item.label),
+    item.hint && h('span', { class: 'muted small' }, item.hint))));
+    el.hidden = items.length === 0;
+  }
+
+  function choose(i) {
+    const item = items[i];
+    const caret = input.selectionStart;
+    const before = input.value.slice(0, start);
+    const after = input.value.slice(caret);
+    const insert = `@${item.value} `;
+    input.value = before + insert + after;
+    const pos = before.length + insert.length;
+    input.setSelectionRange(pos, pos);
+    input.dispatchEvent(new Event('input'));
+    hide();
+    input.focus();
+  }
+
+  function update() {
+    const caret = input.selectionStart;
+    const text = input.value.slice(0, caret);
+    const match = text.match(/(?:^|[^\p{L}\p{N}_])@([^@\n]{0,30})$/u);
+    if (!match || /\s{2}|^\s/.test(match[1])) return hide();
+    start = caret - match[1].length - 1;
+    items = candidates(match[1]);
+    index = 0;
+    render();
+  }
+
+  function handleKey(e) {
+    if (el.hidden) return false;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      index = (index + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+      render();
+    } else if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey) {
+      choose(index);
+    } else if (e.key === 'Escape') {
+      hide();
+    } else {
+      return false;
+    }
+    e.preventDefault();
+    return true;
+  }
+
+  input.addEventListener('blur', hide);
+  return { el, update, handleKey };
+}
+
+// --- Notifications ------------------------------------------------------------
+
+function notificationText(n, { withEmoji = true } = {}) {
+  const who = userName(n.actorId);
+  const c = state.channels.get(n.channelId);
+  const where = c ? (c.isDm ? 'en message privé' : `dans #${c.name}`) : '';
+  if (n.kind === 'mention') return `${who} vous a mentionné ${where}`;
+  if (n.kind === 'reply') return `${who} a répondu dans un fil ${where}`;
+  return `${who} a réagi${withEmoji ? ` ${n.emoji}` : ''} à votre message ${where}`;
+}
+
+const notificationHash = (n) => (n.parentId ? `#/c/${n.channelId}/t/${n.parentId}` : `#/c/${n.channelId}`);
+
+// La notification concerne-t-elle ce que la personne a sous les yeux en ce moment ?
+function isOnScreen(n) {
+  const v = state.view;
+  if (document.visibilityState !== 'visible' || v?.kind !== 'channel' || v.id !== n.channelId) return false;
+  return n.parentId ? v.thread?.rootId === n.parentId : true;
+}
+
+function onNotification(n) {
+  if (state.notifications.some((x) => x.id === n.id)) return;
+  state.notifications.unshift(n);
+  state.notifications.length = Math.min(state.notifications.length, 50);
+  if (isOnScreen(n)) {
+    n.read = true;
+    api('POST', '/notifications/read', { ids: [n.id] }).catch(() => {});
+  } else {
+    state.notifUnread += 1;
+    const channel = state.channels.get(n.channelId);
+    // Les messages privés font déjà l'objet d'une notification de bureau à part.
+    if (!channel?.isDm || n.kind === 'reaction') desktopNotify(notificationText(n), n.excerpt, notificationHash(n));
+  }
+  renderSidebar();
+  if (state.view?.kind === 'activity') renderActivity(state.view);
+}
+
+function forgetNotifications(messageId) {
+  const gone = state.notifications.filter((n) => n.messageId === messageId);
+  if (!gone.length) return;
+  state.notifications = state.notifications.filter((n) => n.messageId !== messageId);
+  state.notifUnread = Math.max(0, state.notifUnread - gone.filter((n) => !n.read).length);
+  renderSidebar();
+  if (state.view?.kind === 'activity') renderActivity(state.view);
+}
+
+async function readNotificationsWhere(match) {
+  const ids = state.notifications.filter((n) => !n.read && match(n)).map((n) => n.id);
+  if (!ids.length) return;
+  for (const n of state.notifications) if (ids.includes(n.id)) n.read = true;
+  state.notifUnread = Math.max(0, state.notifUnread - ids.length);
+  renderSidebar();
+  try {
+    const { unread } = await api('POST', '/notifications/read', { ids });
+    state.notifUnread = unread;
+    renderSidebar();
+  } catch (err) { report(err); }
+}
+
+async function readAllNotifications() {
+  try {
+    await api('POST', '/notifications/read', {});
+    for (const n of state.notifications) n.read = true;
+    state.notifUnread = 0;
+    renderSidebar();
+    if (state.view?.kind === 'activity') renderActivity(state.view);
+  } catch (err) { report(err); }
+}
+
+const desktopSupported = 'Notification' in window;
+const desktopEnabled = () => desktopSupported && Notification.permission === 'granted' && storage.get('makora.desktop', true);
+
+function desktopNotify(title, body, hash) {
+  if (!desktopEnabled() || (document.visibilityState === 'visible' && document.hasFocus())) return;
+  try {
+    const n = new Notification(title, { body: body.slice(0, 200), icon: '/favicon.svg', tag: hash });
+    n.onclick = () => {
+      window.focus();
+      location.hash = hash;
+      n.close();
+    };
+  } catch {
+    // Certains navigateurs mobiles n'autorisent les notifications que via un service worker.
+  }
+}
+
+function desktopControl(v) {
+  if (!desktopSupported) return null;
+  if (Notification.permission === 'denied') {
+    return h('span', { class: 'muted small' }, 'Notifications du bureau bloquées par le navigateur');
+  }
+  if (Notification.permission === 'default') {
+    return h('button', {
+      class: 'btn small',
+      onclick: async () => {
+        await Notification.requestPermission();
+        renderActivity(v);
+      },
+    }, '🔔 Activer les notifications du bureau');
+  }
+  const on = storage.get('makora.desktop', true);
+  return h('button', {
+    class: 'btn small', 'aria-pressed': on ? 'true' : 'false',
+    onclick: () => { storage.set('makora.desktop', !on); renderActivity(v); },
+  }, on ? '🔔 Bureau : activées' : '🔕 Bureau : désactivées');
+}
+
+function openActivity() {
+  const v = { kind: 'activity' };
+  state.view = v;
+  renderSidebar();
+  v.head = h('header', { class: 'main-head' });
+  v.list = h('div', { class: 'activity' });
+  els.main.replaceChildren(v.head, h('div', { class: 'page-scroll' }, v.list));
+  renderActivity(v);
+}
+
+function renderActivity(v) {
+  v.head.replaceChildren(
+    navButton(),
+    h('div', { class: 'head-title' }, h('h1', {}, 'Activité'),
+      h('span', { class: 'muted small' }, 'Mentions, réponses à vos fils et réactions à vos messages')),
+    h('div', { class: 'head-actions' },
+      desktopControl(v),
+      state.notifUnread > 0 && h('button', { class: 'btn small', onclick: readAllNotifications }, 'Tout marquer comme lu')));
+
+  if (!state.notifications.length) {
+    v.list.replaceChildren(h('div', { class: 'empty-state' }, h('h2', {}, 'Rien de neuf 🌤'),
+      h('p', { class: 'muted' }, 'Vous verrez ici quand quelqu’un vous mentionne, répond à un de vos fils ou réagit à vos messages.')));
+    return;
+  }
+  v.list.replaceChildren(...state.notifications.map((n) => h('a', {
+    class: `activity-item${n.read ? '' : ' unread'}`,
+    href: notificationHash(n),
+    onclick: () => { if (!n.read) readNotificationsWhere((x) => x.id === n.id); },
+  },
+  avatar(n.actorId),
+  h('div', { class: 'activity-body' },
+    h('div', {}, h('span', { class: 'activity-kind', 'aria-hidden': 'true' }, n.kind === 'mention' ? '@' : n.kind === 'reply' ? '💬' : n.emoji), ' ',
+      h('strong', {}, notificationText(n, { withEmoji: false }))),
+    n.excerpt && h('div', { class: 'md muted', html: md(n.excerpt) }),
+    h('time', { class: 'muted small', datetime: new Date(n.createdAt).toISOString() }, relativeTime(n.createdAt))),
+  !n.read && h('span', { class: 'unread-dot', title: 'Non lu' }))));
+}
+
 // --- Recherche --------------------------------------------------------------
 
 async function openSearch(term) {
@@ -1298,7 +1629,7 @@ async function openSearch(term) {
         return h('a', { class: 'result', href: m.parentId ? `#/c/${m.channelId}/t/${m.parentId}` : `#/c/${m.channelId}` },
           h('div', { class: 'small' }, h('strong', {}, userName(m.userId)), ' dans ', c ? channelTitle(c) : 'un canal',
             ' · ', h('span', { class: 'muted' }, dateTimeFmt.format(m.createdAt))),
-          h('div', { class: 'md', html: renderMarkdown(m.body) }));
+          h('div', { class: 'md', html: md(m.body) }));
       })));
   } catch (err) {
     report(err);

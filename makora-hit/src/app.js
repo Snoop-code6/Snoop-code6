@@ -7,6 +7,7 @@ import {
   parseCookies, SESSION_COOKIE, sessionCookie, userFromToken, verifyPassword,
 } from './auth.js';
 import { transaction } from './db.js';
+import { mentionRegex } from '../public/markdown.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
@@ -14,6 +15,10 @@ const PAGE_SIZE = 50;
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
 const ORPHAN_TTL_MS = 24 * 3600 * 1000;
+const MAX_REACTIONS_PER_MESSAGE = 20;
+// Un emoji (avec ses variantes : couleur de peau, drapeaux, séquences ZWJ), et rien d'autre.
+const EMOJI = /^(?:\p{Extended_Pictographic}|\p{Regional_Indicator})[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f]*$/u;
+const EVERYONE = 'tous';
 // Seules ces images sont affichées dans la page ; tout le reste est proposé en téléchargement.
 const INLINE_IMAGES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
@@ -156,6 +161,28 @@ export function createApp({ db, hub, uploadDir: dir }) {
       WHERE message_id = ?1 OR message_id IN (SELECT id FROM messages WHERE parent_id = ?1)`),
     orphanAttachments: db.prepare('SELECT id, storage_key FROM attachments WHERE message_id IS NULL AND created_at < ?'),
     deleteAttachment: db.prepare('DELETE FROM attachments WHERE id = ?'),
+    reactionsFor: db.prepare(`SELECT message_id, emoji, user_id FROM reactions
+      WHERE message_id IN (SELECT value FROM json_each(?)) ORDER BY created_at, rowid`),
+    reaction: db.prepare('SELECT 1 FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?'),
+    reactionKinds: db.prepare('SELECT COUNT(DISTINCT emoji) AS n FROM reactions WHERE message_id = ? AND emoji != ?'),
+    addReaction: db.prepare('INSERT INTO reactions (message_id, user_id, emoji, created_at) VALUES (?, ?, ?, ?)'),
+    removeReaction: db.prepare('DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?'),
+    threadParticipants: db.prepare('SELECT DISTINCT user_id FROM messages WHERE (id = ?1 OR parent_id = ?1) AND user_id IS NOT NULL'),
+    insertNotification: db.prepare(`INSERT INTO notifications (user_id, kind, actor_id, message_id, emoji, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)`),
+    removeReactionNotification: db.prepare(`DELETE FROM notifications
+      WHERE kind = 'reaction' AND actor_id = ? AND message_id = ? AND emoji = ?`),
+    notification: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id,
+        (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count
+      FROM notifications n JOIN messages m ON m.id = n.message_id WHERE n.id = ?`),
+    notifications: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id,
+        (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count
+      FROM notifications n JOIN messages m ON m.id = n.message_id
+      WHERE n.user_id = ? ORDER BY n.id DESC LIMIT 50`),
+    unreadNotifications: db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL'),
+    readNotifications: db.prepare(`UPDATE notifications SET read_at = ?
+      WHERE user_id = ? AND read_at IS NULL AND id IN (SELECT value FROM json_each(?))`),
+    readAllNotifications: db.prepare('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL'),
     pages: db.prepare('SELECT id, parent_id, title, updated_at FROM pages ORDER BY created_at, id'),
     page: db.prepare('SELECT * FROM pages WHERE id = ?'),
     insertPage: db.prepare(`INSERT INTO pages (parent_id, title, content, created_by, updated_by, created_at, updated_at)
@@ -203,24 +230,85 @@ export function createApp({ db, hub, uploadDir: dir }) {
     else hub.broadcast(event);
   }
 
-  // Transforme des lignes de la table messages en objets d'API, pièces jointes comprises.
+  // Regroupe les réactions par emoji : [{ emoji, userIds }], dans l'ordre d'apparition.
+  function reactionsByMessage(ids) {
+    const byMessage = new Map();
+    if (!ids.length) return byMessage;
+    for (const r of q.reactionsFor.all(JSON.stringify(ids))) {
+      if (!byMessage.has(r.message_id)) byMessage.set(r.message_id, []);
+      const list = byMessage.get(r.message_id);
+      let entry = list.find((e) => e.emoji === r.emoji);
+      if (!entry) list.push(entry = { emoji: r.emoji, userIds: [] });
+      entry.userIds.push(r.user_id);
+    }
+    return byMessage;
+  }
+
+  // Transforme des lignes de la table messages en objets d'API, pièces jointes et réactions comprises.
   function toMessages(rows) {
     const byMessage = new Map();
+    const ids = rows.map((r) => r.id);
     if (rows.length) {
-      for (const a of q.attachmentsFor.all(JSON.stringify(rows.map((r) => r.id)))) {
+      for (const a of q.attachmentsFor.all(JSON.stringify(ids))) {
         if (!byMessage.has(a.message_id)) byMessage.set(a.message_id, []);
         byMessage.get(a.message_id).push(toAttachment(a));
       }
     }
+    const reactions = reactionsByMessage(ids);
     return rows.map((m) => ({
       id: m.id, channelId: m.channel_id, userId: m.user_id, parentId: m.parent_id, body: m.body,
       createdAt: m.created_at, editedAt: m.edited_at,
       replyCount: m.reply_count ?? 0, lastReplyAt: m.last_reply_at ?? null,
       attachments: byMessage.get(m.id) ?? [],
+      reactions: reactions.get(m.id) ?? [],
     }));
   }
 
   const toMessage = (row) => toMessages([row])[0];
+
+  // --- Notifications -------------------------------------------------------
+
+  function toNotification(n) {
+    const excerpt = n.body.replace(/\s+/g, ' ').trim().slice(0, 160);
+    return {
+      id: n.id, kind: n.kind, actorId: n.actor_id, messageId: n.message_id, channelId: n.channel_id,
+      parentId: n.parent_id, emoji: n.emoji, createdAt: n.created_at, read: Boolean(n.read_at),
+      excerpt: excerpt || (n.attachment_count ? '📎 Pièce jointe' : ''),
+    };
+  }
+
+  function notify(userId, kind, actorId, messageId, emoji = null) {
+    const id = q.insertNotification.run(userId, kind, actorId, messageId, emoji, Date.now()).lastInsertRowid;
+    hub.sendTo([userId], { type: 'notification:new', notification: toNotification(q.notification.get(id)) });
+  }
+
+  function canRead(channel, userId) {
+    return !channel.is_dm || Boolean(q.member.get(channel.id, userId));
+  }
+
+  // Une seule notification par personne et par message : la mention l'emporte sur la réponse dans un fil.
+  function notifyForMessage(message, channel, author) {
+    const targets = new Map();
+    const users = q.users.all();
+    const names = [...users.map((u) => u.name), EVERYONE];
+    for (const match of message.body.matchAll(mentionRegex(names))) {
+      const name = match[2].toLowerCase();
+      if (name === EVERYONE) {
+        for (const { user_id: id } of q.members.all(channel.id)) targets.set(id, 'mention');
+      } else {
+        for (const u of users) if (u.name.toLowerCase() === name) targets.set(u.id, 'mention');
+      }
+    }
+    if (message.parentId) {
+      for (const { user_id: id } of q.threadParticipants.all(message.parentId)) {
+        if (!targets.has(id)) targets.set(id, 'reply');
+      }
+    }
+    targets.delete(author.id);
+    for (const [userId, kind] of targets) {
+      if (canRead(channel, userId)) notify(userId, kind, author.id, message.id);
+    }
+  }
 
   function removeFiles(keys) {
     for (const key of keys) rmSync(join(uploadDir, key), { force: true });
@@ -418,7 +506,53 @@ export function createApp({ db, hub, uploadDir: dir }) {
       return toMessage(q.message.get(id));
     });
     emitToChannel(channel, { type: 'message:new', message });
+    notifyForMessage(message, channel, req.user);
     res.status(201).json({ message });
+  });
+
+  // Ajoute la réaction si elle n'y est pas, la retire sinon.
+  api.post('/messages/:id/reactions', (req, res) => {
+    const message = q.message.get(intParam(req.params.id));
+    if (!message) fail(404, 'Message introuvable.');
+    const channel = readableChannel(message.channel_id, req.user);
+    const emoji = String(req.body?.emoji ?? '');
+    if (emoji.length > 32 || !EMOJI.test(emoji)) fail(400, 'Réaction invalide.');
+
+    let added = false;
+    transaction(db, () => {
+      if (q.reaction.get(message.id, req.user.id, emoji)) {
+        q.removeReaction.run(message.id, req.user.id, emoji);
+        q.removeReactionNotification.run(req.user.id, message.id, emoji);
+      } else {
+        if (q.reactionKinds.get(message.id, emoji).n >= MAX_REACTIONS_PER_MESSAGE) fail(400, 'Trop de réactions différentes sur ce message.');
+        q.addReaction.run(message.id, req.user.id, emoji, Date.now());
+        added = true;
+      }
+    });
+    const reactions = reactionsByMessage([message.id]).get(message.id) ?? [];
+    emitToChannel(channel, {
+      type: 'message:reactions', messageId: message.id, channelId: channel.id, parentId: message.parent_id, reactions,
+    });
+    if (added && message.user_id && message.user_id !== req.user.id && canRead(channel, message.user_id)) {
+      notify(message.user_id, 'reaction', req.user.id, message.id, emoji);
+    }
+    res.json({ reactions });
+  });
+
+  api.get('/notifications', (req, res) => {
+    res.json({
+      notifications: q.notifications.all(req.user.id).map(toNotification),
+      unread: q.unreadNotifications.get(req.user.id).n,
+    });
+  });
+
+  // Sans liste d'identifiants, tout est marqué comme lu.
+  api.post('/notifications/read', (req, res) => {
+    const ids = req.body?.ids;
+    if (ids === undefined) q.readAllNotifications.run(Date.now(), req.user.id);
+    else if (Array.isArray(ids) && ids.every(Number.isInteger)) q.readNotifications.run(Date.now(), req.user.id, JSON.stringify(ids));
+    else fail(400, 'Liste de notifications invalide.');
+    res.json({ unread: q.unreadNotifications.get(req.user.id).n });
   });
 
   api.get('/messages/:id/replies', (req, res) => {

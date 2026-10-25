@@ -68,6 +68,27 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id);
 
+CREATE TABLE IF NOT EXISTS reactions (
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  emoji      TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (message_id, user_id, emoji)
+);
+
+-- Fil « Activité » : mentions, réponses dans les fils suivis, réactions à ses messages.
+CREATE TABLE IF NOT EXISTS notifications (
+  id         INTEGER PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL CHECK (kind IN ('mention', 'reply', 'reaction')),
+  actor_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  emoji      TEXT,
+  created_at INTEGER NOT NULL,
+  read_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id);
+
 CREATE TABLE IF NOT EXISTS pages (
   id         INTEGER PRIMARY KEY,
   parent_id  INTEGER REFERENCES pages(id) ON DELETE CASCADE,

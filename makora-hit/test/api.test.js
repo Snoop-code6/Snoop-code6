@@ -270,6 +270,17 @@ describe('markdown', () => {
     assert.ok(!/href="[^"]*"onmouseover/.test(html));
   });
 
+  test('mentions : seuls les noms connus sont mis en évidence', () => {
+    const opts = { mentions: ['Alice Martin', 'Bob', 'tous'], me: 'Bob' };
+    const html = renderMarkdown('@alice martin et @Bob, @tous ! @inconnu mail a@b.fr <@Bob>', opts);
+    assert.match(html, /<span class="mention">@alice martin<\/span>/);
+    assert.match(html, /<span class="mention mention-self">@Bob<\/span>,/);
+    assert.match(html, /<span class="mention">@tous<\/span>/);
+    assert.ok(!html.includes('@inconnu</span>'));
+    assert.ok(!html.includes('a<span'));
+    assert.ok(!html.includes('<@'));
+  });
+
   test('blocs : titres, listes, tâches, code', () => {
     const html = renderMarkdown('# Titre\n- un\n- [x] fait\n1. premier\n```\n<b>code</b>\n```');
     assert.match(html, /<h1>Titre<\/h1>/);
@@ -424,5 +435,144 @@ describe('fils de discussion', () => {
     assert.equal((await admin.call('GET', `/messages/${id}/replies`)).status, 404);
     const search = (await admin.call('GET', '/search?q=Moi%20aussi')).data;
     assert.equal(search.messages.length, 0);
+  });
+});
+
+describe('réactions', () => {
+  let general;
+  let msg;
+
+  before(async () => {
+    general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+    msg = (await bob.call('POST', `/channels/${general.id}/messages`, { body: 'On déjeune ensemble ?' })).data.message;
+  });
+
+  test('ajouter, cumuler puis retirer une réaction', async () => {
+    const ws = socket(carol.cookie);
+    await ws.opened;
+    const first = await admin.call('POST', `/messages/${msg.id}/reactions`, { emoji: '👍' });
+    assert.equal(first.status, 200);
+    const ev = await ws.next((e) => e.type === 'message:reactions' && e.messageId === msg.id);
+    assert.equal(ev.reactions[0].emoji, '👍');
+    ws.ws.close();
+
+    await carol.call('POST', `/messages/${msg.id}/reactions`, { emoji: '👍' });
+    await carol.call('POST', `/messages/${msg.id}/reactions`, { emoji: '🍕' });
+    const listed = (await bob.call('GET', `/channels/${general.id}/messages`)).data.messages.find((m) => m.id === msg.id);
+    assert.deepEqual(listed.reactions.map((r) => [r.emoji, r.userIds.length]), [['👍', 2], ['🍕', 1]]);
+
+    const removed = (await carol.call('POST', `/messages/${msg.id}/reactions`, { emoji: '🍕' })).data.reactions;
+    assert.deepEqual(removed.map((r) => r.emoji), ['👍']);
+  });
+
+  test('emojis composés acceptés, texte refusé', async () => {
+    assert.equal((await admin.call('POST', `/messages/${msg.id}/reactions`, { emoji: '👍🏽' })).status, 200);
+    assert.equal((await admin.call('POST', `/messages/${msg.id}/reactions`, { emoji: '👨‍👩‍👧' })).status, 200);
+    assert.equal((await admin.call('POST', `/messages/${msg.id}/reactions`, { emoji: '🇫🇷' })).status, 200);
+    for (const bad of ['ok', '<b>', '', '👍 x', '1']) {
+      assert.equal((await admin.call('POST', `/messages/${msg.id}/reactions`, { emoji: bad })).status, 400, bad);
+    }
+  });
+
+  test('impossible de réagir à un message privé d’autrui', async () => {
+    const bobId = (await bob.call('GET', '/me')).data.user.id;
+    const { data: { channel } } = await admin.call('POST', '/dms', { userId: bobId });
+    const dm = (await admin.call('POST', `/channels/${channel.id}/messages`, { body: 'entre nous' })).data.message;
+    assert.equal((await carol.call('POST', `/messages/${dm.id}/reactions`, { emoji: '👀' })).status, 404);
+  });
+});
+
+describe('notifications', () => {
+  let general;
+  const unread = async (who) => (await who.call('GET', '/notifications')).data;
+
+  before(async () => {
+    general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+    await admin.call('POST', '/notifications/read', {});
+    await bob.call('POST', '/notifications/read', {});
+    await carol.call('POST', '/notifications/read', {});
+  });
+
+  test('une @mention notifie la personne en temps réel', async () => {
+    const ws = socket(carol.cookie);
+    await ws.opened;
+    const { data: { message } } = await bob.call('POST', `/channels/${general.id}/messages`, { body: 'Tu peux relire, @carol petit ?' });
+    const ev = await ws.next((e) => e.type === 'notification:new');
+    ws.ws.close();
+    assert.equal(ev.notification.kind, 'mention');
+    assert.equal(ev.notification.messageId, message.id);
+    assert.equal(ev.notification.excerpt, 'Tu peux relire, @carol petit ?');
+    const data = await unread(carol);
+    assert.equal(data.unread, 1);
+    assert.equal((await unread(admin)).unread, 0);
+  });
+
+  test('marquer comme lu', async () => {
+    const { notifications } = await unread(carol);
+    const res = await carol.call('POST', '/notifications/read', { ids: [notifications[0].id] });
+    assert.equal(res.data.unread, 0);
+    // On ne peut pas toucher aux notifications des autres.
+    assert.equal((await bob.call('POST', '/notifications/read', { ids: 'tout' })).status, 400);
+  });
+
+  test('@tous notifie les membres du canal sauf l’auteur', async () => {
+    await admin.call('POST', `/channels/${general.id}/messages`, { body: '@tous réunion à 14h' });
+    assert.equal((await unread(bob)).notifications[0].kind, 'mention');
+    assert.equal((await unread(carol)).notifications[0].kind, 'mention');
+    assert.equal((await unread(admin)).unread, 0);
+    await bob.call('POST', '/notifications/read', {});
+    await carol.call('POST', '/notifications/read', {});
+  });
+
+  test('les participants d’un fil sont notifiés des réponses', async () => {
+    const root = (await admin.call('POST', `/channels/${general.id}/messages`, { body: 'Idées pour le séminaire ?' })).data.message;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: 'Le Pays basque !', parentId: root.id });
+    let a = await unread(admin);
+    assert.equal(a.unread, 1);
+    assert.equal(a.notifications[0].kind, 'reply');
+    assert.equal(a.notifications[0].parentId, root.id);
+    assert.equal((await unread(carol)).unread, 0); // Carol ne participe pas au fil.
+
+    // Bob participe désormais : il est notifié de la réponse de Carol, Alice aussi.
+    await carol.call('POST', `/channels/${general.id}/messages`, { body: 'Plutôt la montagne', parentId: root.id });
+    assert.equal((await unread(bob)).notifications[0].kind, 'reply');
+    a = await unread(admin);
+    assert.equal(a.unread, 2);
+
+    // Une mention dans un fil compte comme mention, pas comme réponse en double.
+    await carol.call('POST', `/channels/${general.id}/messages`, { body: '@Alice Martin tu tranches ?', parentId: root.id });
+    a = await unread(admin);
+    assert.equal(a.unread, 3);
+    assert.equal(a.notifications[0].kind, 'mention');
+    await admin.call('POST', '/notifications/read', {});
+    await bob.call('POST', '/notifications/read', {});
+  });
+
+  test('une réaction notifie l’auteur, la retirer efface la notification', async () => {
+    const msg = (await bob.call('POST', `/channels/${general.id}/messages`, { body: 'Rapport envoyé' })).data.message;
+    await carol.call('POST', `/messages/${msg.id}/reactions`, { emoji: '🎉' });
+    let b = await unread(bob);
+    assert.equal(b.notifications[0].kind, 'reaction');
+    assert.equal(b.notifications[0].emoji, '🎉');
+    await carol.call('POST', `/messages/${msg.id}/reactions`, { emoji: '🎉' });
+    b = await unread(bob);
+    assert.equal(b.unread, 0);
+    // Réagir à son propre message ne notifie personne.
+    await bob.call('POST', `/messages/${msg.id}/reactions`, { emoji: '✅' });
+    assert.equal((await unread(bob)).unread, 0);
+  });
+
+  test('pas de notification pour quelqu’un qui ne peut pas lire le message', async () => {
+    const bobId = (await bob.call('GET', '/me')).data.user.id;
+    const { data: { channel } } = await admin.call('POST', '/dms', { userId: bobId });
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: 'Ne dis rien à @Carol Petit' });
+    assert.equal((await unread(carol)).unread, 0);
+  });
+
+  test('supprimer le message supprime ses notifications', async () => {
+    const msg = (await bob.call('POST', `/channels/${general.id}/messages`, { body: '@Carol Petit oups' })).data.message;
+    assert.equal((await unread(carol)).unread, 1);
+    await bob.call('DELETE', `/messages/${msg.id}`);
+    assert.equal((await unread(carol)).unread, 0);
   });
 });
