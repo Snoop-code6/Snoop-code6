@@ -5,13 +5,14 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.js';
 import { openDb } from './db.js';
+import { createPushSender } from './push.js';
 import { attachWebSocket, createHub } from './realtime.js';
 
-export function startServer({ port = 3000, host, dbFile = ':memory:', uploadDir } = {}) {
+export function startServer({ port = 3000, host, dbFile = ':memory:', uploadDir, push } = {}) {
   const db = openDb(dbFile);
   const hub = createHub();
   const dir = uploadDir ?? mkdtempSync(join(tmpdir(), 'makora-uploads-'));
-  const server = createServer(createApp({ db, hub, uploadDir: dir }));
+  const server = createServer(createApp({ db, hub, uploadDir: dir, push: push === undefined ? createPushSender(db) : push }));
   const wss = attachWebSocket(server, { db, hub });
 
   return new Promise((resolve) => {

@@ -7,8 +7,18 @@ import { renderMarkdown } from '../public/markdown.js';
 let srv;
 let base;
 
+// Faux service push : on garde ce qui aurait été envoyé aux téléphones.
+const pushed = [];
+const fakePush = {
+  publicKey: 'cle-publique-de-test',
+  async send(subscription, payload) {
+    if (subscription.endpoint.includes('expire')) throw Object.assign(new Error('Gone'), { statusCode: 410 });
+    pushed.push({ endpoint: subscription.endpoint, payload });
+  },
+};
+
 before(async () => {
-  srv = await startServer({ port: 0, host: '127.0.0.1' });
+  srv = await startServer({ port: 0, host: '127.0.0.1', push: fakePush });
   base = `http://127.0.0.1:${srv.port}`;
 });
 
@@ -574,5 +584,247 @@ describe('notifications', () => {
     assert.equal((await unread(carol)).unread, 1);
     await bob.call('DELETE', `/messages/${msg.id}`);
     assert.equal((await unread(carol)).unread, 0);
+  });
+});
+
+
+describe('canaux privés', () => {
+  let ids;
+  let secret;
+
+  before(async () => {
+    ids = {
+      admin: (await admin.call('GET', '/me')).data.user.id,
+      bob: (await bob.call('GET', '/me')).data.user.id,
+      carol: (await carol.call('GET', '/me')).data.user.id,
+    };
+  });
+
+  test('créer un canal privé avec des membres', async () => {
+    const bobWs = socket(bob.cookie);
+    const carolWs = socket(carol.cookie);
+    await Promise.all([bobWs.opened, carolWs.opened]);
+    const { status, data } = await admin.call('POST', '/channels', { name: 'direction', isPrivate: true, memberIds: [ids.bob] });
+    assert.equal(status, 201);
+    secret = data.channel;
+    assert.equal(secret.isPrivate, true);
+    assert.equal(secret.memberCount, 2);
+    const ev = await bobWs.next((e) => e.type === 'channel:joined' && e.channel.id === secret.id);
+    assert.equal(ev.channel.joined, true);
+    await admin.call('POST', `/channels/${secret.id}/messages`, { body: 'Budget confidentiel' });
+    await bobWs.next((e) => e.type === 'message:new' && e.message.channelId === secret.id);
+    assert.ok(!carolWs.events.some((e) => e.channel?.id === secret.id || e.message?.channelId === secret.id));
+    bobWs.ws.close();
+    carolWs.ws.close();
+  });
+
+  test('invisible et inaccessible pour les non-membres', async () => {
+    assert.ok(!(await carol.call('GET', '/channels')).data.channels.some((c) => c.id === secret.id));
+    assert.equal((await carol.call('GET', `/channels/${secret.id}/messages`)).status, 404);
+    assert.equal((await carol.call('POST', `/channels/${secret.id}/join`)).status, 404);
+    assert.equal((await carol.call('GET', `/channels/${secret.id}/members`)).status, 404);
+    assert.equal((await carol.call('GET', '/search?q=Budget%20confidentiel')).data.messages.length, 0);
+    assert.equal((await bob.call('GET', '/search?q=Budget%20confidentiel')).data.messages.length, 1);
+  });
+
+  test('un membre peut ajouter quelqu’un, qui voit alors l’historique', async () => {
+    const res = await bob.call('POST', `/channels/${secret.id}/members`, { userIds: [ids.carol] });
+    assert.deepEqual(res.data.added, [ids.carol]);
+    assert.equal((await carol.call('GET', `/channels/${secret.id}/messages`)).data.messages[0].body, 'Budget confidentiel');
+    const listed = (await carol.call('GET', '/channels')).data.channels.find((c) => c.id === secret.id);
+    assert.equal(listed.memberCount, 3);
+    assert.equal((await admin.call('POST', `/channels/${secret.id}/members`, { userIds: [999] })).status, 400);
+  });
+
+  test('seuls le créateur et les admins retirent quelqu’un', async () => {
+    assert.equal((await carol.call('DELETE', `/channels/${secret.id}/members/${ids.bob}`)).status, 403);
+    const carolWs = socket(carol.cookie);
+    await carolWs.opened;
+    assert.equal((await admin.call('DELETE', `/channels/${secret.id}/members/${ids.carol}`)).status, 204);
+    await carolWs.next((e) => e.type === 'channel:removed' && e.channelId === secret.id);
+    carolWs.ws.close();
+    assert.equal((await carol.call('GET', `/channels/${secret.id}/messages`)).status, 404);
+  });
+
+  test('chacun peut quitter un canal privé', async () => {
+    assert.equal((await bob.call('DELETE', `/channels/${secret.id}/members/${ids.bob}`)).status, 204);
+    assert.deepEqual((await admin.call('GET', `/channels/${secret.id}/members`)).data.members, [ids.admin]);
+  });
+
+  test('pas de notification pour un non-membre mentionné', async () => {
+    await carol.call('POST', '/notifications/read', {});
+    await admin.call('POST', `/channels/${secret.id}/messages`, { body: '@Carol Petit ne doit pas savoir' });
+    assert.equal((await carol.call('GET', '/notifications')).data.unread, 0);
+  });
+
+  test('ajouter des personnes à un canal public', async () => {
+    const { data: { channel } } = await admin.call('POST', '/channels', { name: 'marketing', memberIds: [ids.carol] });
+    assert.equal(channel.isPrivate, false);
+    assert.ok((await carol.call('GET', '/channels')).data.channels.find((c) => c.id === channel.id).joined);
+    const bobView = (await bob.call('GET', '/channels')).data.channels.find((c) => c.id === channel.id);
+    assert.equal(bobView.joined, false);
+    // Un non-membre d'un canal public ne peut pas y ajouter d'autres personnes.
+    assert.equal((await bob.call('POST', `/channels/${channel.id}/members`, { userIds: [ids.bob] })).status, 403);
+  });
+});
+
+describe('historique des pages', () => {
+  let page;
+  const save = (who, content, version) => who.call('PATCH', `/pages/${page.id}`, { content, version });
+
+  before(async () => {
+    page = (await bob.call('POST', '/pages', { title: 'Charte' })).data.page;
+  });
+
+  test('les enregistrements rapprochés d’une même personne forment une seule version', async () => {
+    let v = (await save(bob, 'Brouillon 1', page.version)).data.page.version;
+    v = (await save(bob, 'Brouillon 2', v)).data.page.version;
+    v = (await save(bob, 'Version de Bob', v)).data.page.version;
+    let list = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
+    assert.equal(list.versions.length, 1);
+    assert.equal(list.current, v);
+
+    // Quelqu'un d'autre écrit : nouvelle version.
+    v = (await save(carol, 'Version de Carol', v)).data.page.version;
+    list = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
+    assert.equal(list.versions.length, 2);
+    assert.equal(list.versions[0].editedBy, (await carol.call('GET', '/me')).data.user.id);
+    page.version = v;
+  });
+
+  test('consulter puis restaurer une version', async () => {
+    const { versions } = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
+    const old = versions.at(-1);
+    const detail = (await carol.call('GET', `/pages/${page.id}/versions/${old.id}`)).data.version;
+    assert.equal(detail.content, 'Version de Bob');
+
+    assert.equal((await carol.call('POST', `/pages/${page.id}/versions/${old.id}/restore`, { version: 1 })).status, 409);
+    const restored = (await carol.call('POST', `/pages/${page.id}/versions/${old.id}/restore`, { version: page.version })).data.page;
+    assert.equal(restored.content, 'Version de Bob');
+    const after = (await bob.call('GET', `/pages/${page.id}/versions`)).data.versions;
+    assert.equal(after.length, 3);
+    assert.equal(after[0].restoredFrom, old.version);
+    // Une restauration n'est jamais fusionnée avec les modifications suivantes.
+    await save(carol, 'Version de Bob, corrigée', restored.version);
+    assert.equal((await bob.call('GET', `/pages/${page.id}/versions`)).data.versions.length, 4);
+  });
+
+  test('une page existant avant l’historique garde son contenu d’origine', async () => {
+    const legacy = (await admin.call('POST', '/pages', { title: 'Ancienne' })).data.page;
+    srv.db.prepare("UPDATE pages SET content = 'Texte historique', version = 5 WHERE id = ?").run(legacy.id);
+    await admin.call('PATCH', `/pages/${legacy.id}`, { content: 'Texte modifié', version: 5 });
+    const versions = (await admin.call('GET', `/pages/${legacy.id}/versions`)).data.versions;
+    assert.equal(versions.length, 2);
+    const original = (await admin.call('GET', `/pages/${legacy.id}/versions/${versions[1].id}`)).data.version;
+    assert.equal(original.content, 'Texte historique');
+  });
+
+  test('déplacer une page ne crée pas de version', async () => {
+    const before = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
+    const parent = (await bob.call('POST', '/pages', { title: 'Dossier' })).data.page;
+    await bob.call('PATCH', `/pages/${page.id}`, { parentId: parent.id, version: before.current });
+    assert.equal((await bob.call('GET', `/pages/${page.id}/versions`)).data.versions.length, before.versions.length);
+  });
+
+  test('version d’une autre page introuvable', async () => {
+    const other = (await bob.call('POST', '/pages', { title: 'Autre' })).data.page;
+    const { versions } = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
+    assert.equal((await bob.call('GET', `/pages/${other.id}/versions/${versions[0].id}`)).status, 404);
+  });
+});
+
+describe('notifications push', () => {
+  let general;
+  const subscribe = (who, endpoint) => who.call('POST', '/push/subscribe', {
+    subscription: { endpoint, keys: { p256dh: 'BPUBLIC', auth: 'secret' } },
+  });
+
+  before(async () => {
+    general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+    pushed.length = 0;
+  });
+
+  test('clé publique exposée et abonnement validé', async () => {
+    assert.equal((await carol.call('GET', '/push/key')).data.publicKey, 'cle-publique-de-test');
+    assert.equal((await subscribe(carol, 'http://pas-https.example/x')).status, 400);
+    assert.equal((await subscribe(carol, 'https://push.example/carol-telephone')).status, 204);
+  });
+
+  test('une mention part en push quand la personne n’a aucun onglet ouvert', async () => {
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: 'Merci @Carol Petit pour le devis' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(pushed.length, 1);
+    assert.equal(pushed[0].endpoint, 'https://push.example/carol-telephone');
+    assert.equal(pushed[0].payload.title, 'Bob Durand vous a mentionné dans #general');
+    assert.equal(pushed[0].payload.body, 'Merci @Carol Petit pour le devis');
+    assert.match(pushed[0].payload.url, new RegExp(`^/#/c/${general.id}$`));
+  });
+
+  test('pas de push si la personne a l’application ouverte', async () => {
+    pushed.length = 0;
+    const ws = socket(carol.cookie);
+    await ws.opened;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: '@Carol Petit tu es là ?' });
+    await ws.next((e) => e.type === 'notification:new');
+    ws.ws.close();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(pushed.length, 0);
+  });
+
+  test('un message privé part en push sans mention', async () => {
+    pushed.length = 0;
+    await new Promise((r) => setTimeout(r, 50)); // laisse le temps à la déconnexion précédente
+    const carolId = (await carol.call('GET', '/me')).data.user.id;
+    const { data: { channel } } = await bob.call('POST', '/dms', { userId: carolId });
+    await bob.call('POST', `/channels/${channel.id}/messages`, { body: 'Tu as 5 minutes ?' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(pushed.length, 1);
+    assert.deepEqual(
+      { title: pushed[0].payload.title, body: pushed[0].payload.body, url: pushed[0].payload.url },
+      { title: 'Bob Durand', body: 'Tu as 5 minutes ?', url: `/#/c/${channel.id}` },
+    );
+  });
+
+  test('un abonnement expiré est supprimé', async () => {
+    await subscribe(carol, 'https://push.example/expire');
+    pushed.length = 0;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: '@Carol Petit encore moi' });
+    await new Promise((r) => setTimeout(r, 50));
+    const rows = srv.db.prepare('SELECT endpoint FROM push_subscriptions').all().map((r) => r.endpoint);
+    assert.ok(!rows.includes('https://push.example/expire'));
+    assert.ok(rows.includes('https://push.example/carol-telephone'));
+  });
+
+  test('désabonnement', async () => {
+    await carol.call('POST', '/push/unsubscribe', { endpoint: 'https://push.example/carol-telephone' });
+    pushed.length = 0;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: '@Carol Petit dernier essai' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(pushed.length, 0);
+  });
+});
+
+describe('push et visibilité', () => {
+  test('un onglet en arrière-plan n’empêche pas le push', async () => {
+    const general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+    await carol.call('POST', '/push/subscribe', { subscription: { endpoint: 'https://push.example/carol-2', keys: { p256dh: 'B', auth: 'a' } } });
+    const ws = socket(carol.cookie);
+    await ws.opened;
+    ws.ws.send(JSON.stringify({ type: 'visibility', visible: false }));
+    await new Promise((r) => setTimeout(r, 50));
+    pushed.length = 0;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: '@Carol Petit réunion !' });
+    await ws.next((e) => e.type === 'notification:new');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(pushed.length, 1);
+
+    // De retour au premier plan : plus de push.
+    ws.ws.send(JSON.stringify({ type: 'visibility', visible: true }));
+    await new Promise((r) => setTimeout(r, 50));
+    pushed.length = 0;
+    await bob.call('POST', `/channels/${general.id}/messages`, { body: '@Carol Petit c’est maintenant' });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(pushed.length, 0);
+    ws.ws.close();
   });
 });

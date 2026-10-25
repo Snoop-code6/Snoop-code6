@@ -1,0 +1,16 @@
+{
+  "name": "MAKORA HIT",
+  "short_name": "MAKORA",
+  "description": "Messagerie d'équipe et wiki interne pour PME.",
+  "lang": "fr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1f2233",
+  "theme_color": "#1f2233",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

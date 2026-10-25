@@ -6,6 +6,8 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 
 **Messagerie**
 - Canaux publics : créer, rejoindre, quitter ; `#general` créé automatiquement
+- **Canaux privés** 🔒 : invisibles pour les non-membres ; les membres ajoutent des personnes, le créateur du canal et les administrateurs peuvent en retirer, chacun peut partir
+- Liste des membres de chaque canal, ajout de personnes dès la création
 - Messages privés entre deux personnes
 - Temps réel (WebSocket) avec reconnexion automatique
 - Compteurs de messages non lus, présence en ligne
@@ -23,17 +25,19 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 - Enregistrement automatique
 - Gestion des conflits : si deux personnes modifient la même page, personne n'écrase le travail de l'autre
 - Mise à jour en direct quand un collègue modifie la page ouverte
+- **Historique des versions** : qui a modifié quoi et quand, comparaison ligne à ligne avec la version actuelle, restauration en un clic (les enregistrements automatiques d'une même personne à moins de 10 minutes d'intervalle forment une seule version ; 200 versions conservées par page)
 
 **Notifications**
 - Onglet **Activité** avec badge : mentions, réponses dans les fils auxquels on participe, réactions à ses messages
 - Une notification déjà sous les yeux (canal ou fil ouvert) est marquée comme lue automatiquement
-- Notifications du bureau (optionnelles) quand l'onglet est en arrière-plan, y compris pour les messages privés
+- **Notifications push** sur ordinateur et mobile, même application fermée : mentions, réponses dans les fils, réactions et messages privés. Elles ne partent que si aucun onglet n'est au premier plan, pour éviter les doublons
 - Le nombre total de non-lus s'affiche dans le titre de l'onglet
 
 **Commun**
 - Comptes avec invitations : le premier inscrit devient administrateur, les suivants rejoignent via un lien d'invitation (usage unique, valable 7 jours)
 - Recherche dans les messages et les pages (les messages privés ne sont visibles que de leurs participants)
 - Interface en français, mode sombre automatique, utilisable sur mobile
+- **Application installable** (PWA) sur Android, iPhone, Windows et macOS : icône sur l'écran d'accueil, plein écran, démarrage même hors ligne
 
 ## Démarrage
 
@@ -55,10 +59,20 @@ Ouvrez http://localhost:3000, créez le compte administrateur, puis invitez vos 
 | `UPLOAD_DIR`  | `data/uploads`      | Dossier des pièces jointes (à sauvegarder avec la base)     |
 | `MAX_UPLOAD_MB` | `20`              | Taille maximale d'une pièce jointe, en Mo                   |
 | `TRUST_PROXY` | non défini          | À définir (ex. `1`) derrière un reverse proxy HTTPS         |
+| `VAPID_SUBJECT` | `mailto:` + email du 1er admin | Contact transmis aux services push (Google, Apple, Mozilla) |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | générées au 1er démarrage | Clés des notifications push ; par défaut créées une fois et conservées en base |
 
 La base de données est mise à niveau automatiquement au démarrage quand une nouvelle version ajoute des fonctionnalités.
 
-En production, placez l'application derrière un reverse proxy HTTPS (Caddy, Nginx…) qui transmet aussi les WebSocket sur `/ws`.
+En production, placez l'application derrière un reverse proxy HTTPS (Caddy, Nginx…) qui transmet aussi les WebSocket sur `/ws`. **Le HTTPS est indispensable** pour installer l'application et recevoir les notifications push (seul `localhost` en est dispensé).
+
+### Installer l'application et activer les notifications
+
+- **Android / Chrome / Edge** : bouton « 📲 Installer l'application » dans la barre latérale (ou menu du navigateur → Installer).
+- **iPhone / iPad** (iOS 16.4 ou plus récent) : dans Safari, Partager → « Sur l'écran d'accueil ». Les notifications push ne fonctionnent sur iOS qu'une fois l'application installée ainsi.
+- Puis, dans l'onglet **Activité** : « Activer les notifications sur cet appareil ». À la déconnexion, l'appareil cesse de recevoir les notifications du compte.
+
+⚠️ Changer les clés VAPID (ou perdre la base) désabonne tous les appareils : chacun devra réactiver les notifications.
 
 ## Développement
 
@@ -74,11 +88,14 @@ src/
   server.js    démarrage HTTP + WebSocket
   app.js       routes de l'API REST (/api/...)
   realtime.js  diffusion des événements en temps réel
+  push.js      envoi des notifications push (clés VAPID)
   auth.js      mots de passe (scrypt), sessions, cookies
   db.js        schéma SQLite
 public/
   index.html, app.css, app.js   interface (JavaScript sans étape de build)
-  markdown.js                   rendu Markdown sécurisé (partagé avec les tests)
+  markdown.js                   rendu Markdown sécurisé (partagé avec le serveur et les tests)
+  sw.js                         service worker : démarrage hors ligne et notifications push
+  manifest.webmanifest, icons/  application installable
 test/
   api.test.js
 ```
@@ -95,8 +112,8 @@ test/
 
 - Pièces jointes dans les pages
 - Notifications par email (résumé des mentions non lues)
-- Notifications push sur mobile (application installable / service worker)
 - Préférences de notification par canal (muet, mentions uniquement)
-- Canaux privés à plusieurs, gestion des membres et des rôles par l'admin
-- Éditeur de pages par blocs (WYSIWYG) et historique des versions
+- Gestion des rôles par l'admin (nommer d'autres administrateurs, désactiver un compte)
+- Renommer / archiver un canal
+- Éditeur de pages par blocs (WYSIWYG)
 - Réinitialisation de mot de passe par email

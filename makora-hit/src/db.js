@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS channels (
   name       TEXT NOT NULL UNIQUE,
   topic      TEXT NOT NULL DEFAULT '',
   is_dm      INTEGER NOT NULL DEFAULT 0,
+  is_private INTEGER NOT NULL DEFAULT 0,
   created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
   created_at INTEGER NOT NULL
 );
@@ -101,6 +102,36 @@ CREATE TABLE IF NOT EXISTS pages (
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS pages_parent ON pages(parent_id);
+
+-- Historique des pages : une version par session d'écriture (les enregistrements automatiques
+-- successifs d'une même personne sont regroupés).
+CREATE TABLE IF NOT EXISTS page_versions (
+  id         INTEGER PRIMARY KEY,
+  page_id    INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  version    INTEGER NOT NULL,
+  title      TEXT NOT NULL,
+  content    TEXT NOT NULL,
+  edited_by  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  restored_from INTEGER,
+  started_at INTEGER NOT NULL,
+  saved_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS page_versions_page ON page_versions(page_id, id);
+
+-- Abonnements aux notifications push (un par appareil).
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+  id         INTEGER PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  endpoint   TEXT NOT NULL UNIQUE,
+  p256dh     TEXT NOT NULL,
+  auth       TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `;
 
 export function openDb(file = ':memory:') {
@@ -119,6 +150,11 @@ function migrate(db) {
     db.exec('ALTER TABLE messages ADD COLUMN parent_id INTEGER REFERENCES messages(id) ON DELETE CASCADE');
   }
   db.exec('CREATE INDEX IF NOT EXISTS messages_parent ON messages(parent_id)');
+
+  const channelColumns = db.prepare('PRAGMA table_info(channels)').all().map((c) => c.name);
+  if (!channelColumns.includes('is_private')) {
+    db.exec('ALTER TABLE channels ADD COLUMN is_private INTEGER NOT NULL DEFAULT 0');
+  }
 }
 
 export function transaction(db, fn) {

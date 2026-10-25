@@ -18,6 +18,9 @@ function h(tag, props = {}, ...children) {
   return el;
 }
 
+// Pour replaceChildren, qui afficherait « null » ou « false » en texte : on retire ces valeurs.
+const nodes = (...items) => items.flat().filter((item) => item != null && item !== false);
+
 async function api(method, path, body) {
   const headers = { 'X-Makora': '1' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -109,7 +112,8 @@ const state = {
 };
 
 const userName = (id) => state.users.get(id)?.name ?? 'Utilisateur supprimé';
-const channelTitle = (c) => (c.isDm ? userName(c.dmUserId) : `# ${c.name}`);
+const channelTitle = (c) => (c.isDm ? userName(c.dmUserId) : `${c.isPrivate ? '🔒' : '#'} ${c.name}`);
+const channelRef = (c) => (c.isPrivate ? `🔒${c.name}` : `#${c.name}`);
 const pageTitle = (p) => p?.title?.trim() || 'Sans titre';
 const EVERYONE = 'tous';
 
@@ -142,8 +146,18 @@ async function boot() {
     state.limits = limits;
     await startApp();
   } catch (err) {
-    if (err.status === 401) await showAuth();
-    else root.replaceChildren(h('div', { class: 'splash' }, `Impossible de charger l’application : ${err.message}`));
+    if (err.status === 401) {
+      await showAuth();
+    } else if (!err.status) {
+      // Pas de réseau : l'interface vient du cache, on réessaie dès que la connexion revient.
+      root.replaceChildren(h('div', { class: 'splash' }, h('div', { class: 'center' },
+        h('p', {}, h('strong', {}, 'Vous êtes hors ligne.')),
+        h('p', { class: 'muted' }, 'MAKORA HIT se reconnectera automatiquement dès le retour du réseau.'))));
+      window.addEventListener('online', boot, { once: true });
+      setTimeout(boot, 10_000);
+    } else {
+      root.replaceChildren(h('div', { class: 'splash' }, `Impossible de charger l’application : ${err.message}`));
+    }
   }
 }
 
@@ -208,6 +222,7 @@ async function showAuth() {
 }
 
 async function startApp() {
+  if (state.started) return;
   const [{ users, online }, { channels }, { pages }, activity] = await Promise.all([
     api('GET', '/users'), api('GET', '/channels'), api('GET', '/pages'), api('GET', '/notifications'),
   ]);
@@ -217,13 +232,18 @@ async function startApp() {
   state.pages = new Map(pages.map((p) => [p.id, p]));
   state.notifications = activity.notifications;
   state.notifUnread = activity.unread;
+  if (state.started) return;
+  state.started = true;
   renderShell();
   connect();
+  syncPush();
   window.addEventListener('hashchange', route);
   route();
 }
 
 async function logout() {
+  // Cet appareil ne doit plus recevoir les notifications de ce compte.
+  await disablePush().catch(() => {});
   await api('POST', '/auth/logout').catch(() => {});
   location.reload();
 }
@@ -237,6 +257,7 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   socket = new WebSocket(`${proto}://${location.host}/ws`);
   socket.addEventListener('open', () => {
+    sendVisibility();
     if (retry > 0) resync();
     retry = 0;
     document.body.classList.remove('offline');
@@ -286,6 +307,33 @@ function onEvent(ev) {
       if (!state.channels.has(ev.channel.id)) state.channels.set(ev.channel.id, ev.channel);
       renderSidebar();
       break;
+    case 'channel:joined': {
+      const known = state.channels.get(ev.channel.id);
+      state.channels.set(ev.channel.id, { ...known, ...ev.channel, joined: true, unread: known?.unread ?? 0 });
+      if (!known?.joined && !ev.channel.isDm) toast(`Vous avez été ajouté·e à ${channelRef(ev.channel)}.`, 'info');
+      renderSidebar();
+      break;
+    }
+    case 'channel:removed': {
+      const c = state.channels.get(ev.channelId);
+      if (!c) break;
+      if (ev.isPrivate) state.channels.delete(ev.channelId);
+      else Object.assign(c, { joined: false, unread: 0 });
+      renderSidebar();
+      if (ev.isPrivate && v?.kind === 'channel' && v.id === ev.channelId) {
+        toast(`Vous ne faites plus partie de ${channelRef(c)}.`, 'info');
+        location.hash = '';
+      } else if (v?.kind === 'channel' && v.id === ev.channelId) {
+        renderChannelHeader(v);
+      }
+      break;
+    }
+    case 'channel:members': {
+      const c = state.channels.get(ev.channelId);
+      if (c) c.memberCount = ev.memberCount;
+      if (v?.kind === 'channel' && v.id === ev.channelId) renderChannelHeader(v);
+      break;
+    }
     case 'message:new': {
       const m = ev.message;
       const channel = state.channels.get(m.channelId);
@@ -342,7 +390,14 @@ function onEvent(ev) {
   }
 }
 
+function sendVisibility() {
+  if (socket?.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'visibility', visible: document.visibilityState === 'visible' }));
+  }
+}
+
 document.addEventListener('visibilitychange', () => {
+  sendVisibility();
   if (document.visibilityState === 'visible' && state.view?.kind === 'channel') markRead(state.view);
 });
 
@@ -410,7 +465,7 @@ function renderSidebar() {
       c.unread > 0 && h('span', { class: 'badge' }, c.unread > 99 ? '99+' : c.unread)));
 
   els.channels.replaceChildren(...all.filter((c) => !c.isDm && c.joined)
-    .map((c) => channelItem(c, h('span', { class: 'label' }, h('span', { class: 'hash' }, '#'), c.name))));
+    .map((c) => channelItem(c, h('span', { class: 'label' }, h('span', { class: 'hash' }, c.isPrivate ? '🔒' : '#'), c.name))));
 
   els.dms.replaceChildren(...all.filter((c) => c.isDm)
     .sort((a, b) => userName(a.dmUserId).localeCompare(userName(b.dmUserId)))
@@ -437,9 +492,10 @@ function renderSidebar() {
   els.pages.replaceChildren(...branch(null, 0));
   if (!els.pages.children.length) els.pages.append(h('li', { class: 'muted small empty' }, 'Aucune page'));
 
-  els.activity.replaceChildren(h('a', { href: '#/activity', class: `nav-item${v?.kind === 'activity' ? ' active' : ''}${state.notifUnread ? ' unread' : ''}` },
+  els.activity.replaceChildren(...nodes(h('a', { href: '#/activity', class: `nav-item${v?.kind === 'activity' ? ' active' : ''}${state.notifUnread ? ' unread' : ''}` },
     h('span', { class: 'label' }, h('span', { 'aria-hidden': 'true' }, '🔔'), 'Activité'),
-    state.notifUnread > 0 && h('span', { class: 'badge' }, state.notifUnread > 99 ? '99+' : state.notifUnread)));
+    state.notifUnread > 0 && h('span', { class: 'badge' }, state.notifUnread > 99 ? '99+' : state.notifUnread)),
+  installPrompt && h('button', { class: 'nav-item install', onclick: () => installButton()?.click() }, h('span', { class: 'label' }, '📲 Installer l’application'))));
 
   const unread = all.reduce((n, c) => n + (c.joined ? c.unread : 0), 0) + state.notifUnread;
   document.title = `${unread ? `(${unread}) ` : ''}MAKORA HIT`;
@@ -587,6 +643,9 @@ function renderChannelHeader(v) {
   if (!c) return;
   const actions = [];
   if (!c.isDm) {
+    actions.push(h('button', {
+      class: 'btn small', title: 'Membres du canal', 'aria-label': `${c.memberCount} membres`, onclick: () => openMembersDialog(c),
+    }, `👥 ${c.memberCount ?? ''}`));
     actions.push(c.joined
       ? h('button', { class: 'btn small', onclick: () => leaveChannel(c) }, 'Quitter')
       : h('button', { class: 'btn small primary', onclick: () => joinChannel(c) }, 'Rejoindre'));
@@ -610,10 +669,11 @@ async function joinChannel(c) {
 }
 
 async function leaveChannel(c) {
+  if (c.isPrivate && !confirm(`Quitter ${channelRef(c)} ? Il faudra qu’un membre vous rajoute pour y revenir.`)) return;
   try {
     await api('POST', `/channels/${c.id}/leave`);
-    c.joined = false;
-    c.unread = 0;
+    if (c.isPrivate) state.channels.delete(c.id);
+    else Object.assign(c, { joined: false, unread: 0 });
     location.hash = '';
   } catch (err) { report(err); }
 }
@@ -700,7 +760,7 @@ function renderMessages(v, { keepScroll = false } = {}) {
   if (!v.loading && !v.messages.length) {
     const c = state.channels.get(v.id);
     nodes.push(h('div', { class: 'empty-state' },
-      h('h2', {}, c.isDm ? `Votre conversation avec ${userName(c.dmUserId)}` : `Bienvenue dans #${c.name}`),
+      h('h2', {}, c.isDm ? `Votre conversation avec ${userName(c.dmUserId)}` : `Bienvenue dans ${channelRef(c)}`),
       h('p', { class: 'muted' }, 'Aucun message pour l’instant. Lancez la discussion !')));
   }
   nodes.push(...messageNodes(v, v.messages));
@@ -884,7 +944,7 @@ function renderComposer(v, { parentId = null } = {}) {
   const chips = h('div', { class: 'chips' });
   const input = h('textarea', {
     rows: 1,
-    placeholder: parentId ? 'Répondre dans le fil…' : `Écrire ${c.isDm ? `à ${userName(c.dmUserId)}` : `dans #${c.name}`}`,
+    placeholder: parentId ? 'Répondre dans le fil…' : `Écrire ${c.isDm ? `à ${userName(c.dmUserId)}` : `dans ${channelRef(c)}`}`,
     'aria-label': parentId ? 'Réponse' : 'Message',
   });
   const fileInput = h('input', {
@@ -1039,11 +1099,17 @@ function dialog(title, ...content) {
 
 function openChannelDialog() {
   const error = h('p', { class: 'form-error', role: 'alert' });
+  const people = peoplePicker([...state.users.values()].filter((u) => u.id !== state.me.id));
   const form = h('form', { class: 'stack' },
     h('label', { class: 'field' }, h('span', {}, 'Nom du canal'),
       h('input', { name: 'name', required: true, maxlength: 40, placeholder: 'ex. commercial, projet-alpha' })),
     h('label', { class: 'field' }, h('span', {}, 'Sujet (facultatif)'),
       h('input', { name: 'topic', maxlength: 200, placeholder: 'À quoi sert ce canal ?' })),
+    h('label', { class: 'check' },
+      h('input', { type: 'checkbox', name: 'isPrivate' }),
+      h('span', {}, h('strong', {}, '🔒 Canal privé'),
+        h('span', { class: 'muted small block' }, 'Visible uniquement par ses membres, qui peuvent y ajouter d’autres personnes.'))),
+    h('div', { class: 'field' }, h('span', {}, 'Ajouter des personnes (facultatif)'), people.el),
     error,
     h('button', { class: 'btn primary', type: 'submit' }, 'Créer le canal'));
 
@@ -1061,7 +1127,10 @@ function openChannelDialog() {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     try {
-      const { channel } = await api('POST', '/channels', Object.fromEntries(new FormData(form)));
+      const data = new FormData(form);
+      const { channel } = await api('POST', '/channels', {
+        name: data.get('name'), topic: data.get('topic'), isPrivate: data.get('isPrivate') === 'on', memberIds: people.selected(),
+      });
       state.channels.set(channel.id, channel);
       dlg.close();
       location.hash = `#/c/${channel.id}`;
@@ -1186,6 +1255,7 @@ function renderPage(v) {
       h('div', { class: 'head-actions' },
         v.status,
         v.modeBtn = h('button', { class: 'btn small', onclick: () => setMode(v, v.mode === 'edit' ? 'read' : 'edit') }),
+        h('button', { class: 'btn small', onclick: () => openHistory(v) }, 'Historique'),
         h('button', { class: 'btn small', onclick: () => createPage(page.id) }, '+ Sous-page'),
         canDelete && h('button', { class: 'btn small danger', onclick: () => deletePage(v) }, 'Supprimer'))),
     h('div', { class: 'page-scroll' },
@@ -1464,7 +1534,7 @@ function mentionPicker(input) {
 function notificationText(n, { withEmoji = true } = {}) {
   const who = userName(n.actorId);
   const c = state.channels.get(n.channelId);
-  const where = c ? (c.isDm ? 'en message privé' : `dans #${c.name}`) : '';
+  const where = c ? (c.isDm ? 'en message privé' : `dans ${channelRef(c)}`) : '';
   if (n.kind === 'mention') return `${who} vous a mentionné ${where}`;
   if (n.kind === 'reply') return `${who} a répondu dans un fil ${where}`;
   return `${who} a réagi${withEmoji ? ` ${n.emoji}` : ''} à votre message ${where}`;
@@ -1531,39 +1601,26 @@ async function readAllNotifications() {
 const desktopSupported = 'Notification' in window;
 const desktopEnabled = () => desktopSupported && Notification.permission === 'granted' && storage.get('makora.desktop', true);
 
-function desktopNotify(title, body, hash) {
-  if (!desktopEnabled() || (document.visibilityState === 'visible' && document.hasFocus())) return;
+// Notification affichée par la page elle-même, quand l'onglet est ouvert mais pas regardé.
+// Si cet appareil reçoit les push, le serveur s'en charge déjà : on évite les doublons.
+async function desktopNotify(title, body, hash) {
+  if (!desktopEnabled() || pushActive || (document.visibilityState === 'visible' && document.hasFocus())) return;
+  const options = { body: body.slice(0, 200), icon: '/icons/icon-192.png', badge: '/icons/badge-72.png', tag: hash, data: { url: `/${hash}` } };
   try {
-    const n = new Notification(title, { body: body.slice(0, 200), icon: '/favicon.svg', tag: hash });
+    const registration = await navigator.serviceWorker?.getRegistration();
+    if (registration) {
+      await registration.showNotification(title, options);
+      return;
+    }
+    const n = new Notification(title, options);
     n.onclick = () => {
       window.focus();
       location.hash = hash;
       n.close();
     };
   } catch {
-    // Certains navigateurs mobiles n'autorisent les notifications que via un service worker.
+    // Notifications indisponibles dans ce contexte : on n'insiste pas.
   }
-}
-
-function desktopControl(v) {
-  if (!desktopSupported) return null;
-  if (Notification.permission === 'denied') {
-    return h('span', { class: 'muted small' }, 'Notifications du bureau bloquées par le navigateur');
-  }
-  if (Notification.permission === 'default') {
-    return h('button', {
-      class: 'btn small',
-      onclick: async () => {
-        await Notification.requestPermission();
-        renderActivity(v);
-      },
-    }, '🔔 Activer les notifications du bureau');
-  }
-  const on = storage.get('makora.desktop', true);
-  return h('button', {
-    class: 'btn small', 'aria-pressed': on ? 'true' : 'false',
-    onclick: () => { storage.set('makora.desktop', !on); renderActivity(v); },
-  }, on ? '🔔 Bureau : activées' : '🔕 Bureau : désactivées');
 }
 
 function openActivity() {
@@ -1582,15 +1639,17 @@ function renderActivity(v) {
     h('div', { class: 'head-title' }, h('h1', {}, 'Activité'),
       h('span', { class: 'muted small' }, 'Mentions, réponses à vos fils et réactions à vos messages')),
     h('div', { class: 'head-actions' },
-      desktopControl(v),
+      deviceNotificationsControl(v),
+      installButton(),
       state.notifUnread > 0 && h('button', { class: 'btn small', onclick: readAllNotifications }, 'Tout marquer comme lu')));
 
+  const tip = iosInstallTip();
   if (!state.notifications.length) {
-    v.list.replaceChildren(h('div', { class: 'empty-state' }, h('h2', {}, 'Rien de neuf 🌤'),
+    v.list.replaceChildren(tip ?? '', h('div', { class: 'empty-state' }, h('h2', {}, 'Rien de neuf 🌤'),
       h('p', { class: 'muted' }, 'Vous verrez ici quand quelqu’un vous mentionne, répond à un de vos fils ou réagit à vos messages.')));
     return;
   }
-  v.list.replaceChildren(...state.notifications.map((n) => h('a', {
+  v.list.replaceChildren(tip ?? '', ...state.notifications.map((n) => h('a', {
     class: `activity-item${n.read ? '' : ' unread'}`,
     href: notificationHash(n),
     onclick: () => { if (!n.read) readNotificationsWhere((x) => x.id === n.id); },
@@ -1602,6 +1661,351 @@ function renderActivity(v) {
     n.excerpt && h('div', { class: 'md muted', html: md(n.excerpt) }),
     h('time', { class: 'muted small', datetime: new Date(n.createdAt).toISOString() }, relativeTime(n.createdAt))),
   !n.read && h('span', { class: 'unread-dot', title: 'Non lu' }))));
+}
+
+// --- Membres des canaux ----------------------------------------------------------
+
+// Liste de personnes à cocher, avec filtre par nom.
+function peoplePicker(people) {
+  const chosen = new Set();
+  const list = h('ul', { class: 'pick-list people-pick' });
+  const filter = h('input', { type: 'search', placeholder: 'Filtrer par nom…', 'aria-label': 'Filtrer les personnes', class: 'filter' });
+  const render = () => {
+    const q = filter.value.trim().toLowerCase();
+    const shown = people.filter((u) => !q || u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q));
+    list.replaceChildren(...shown.map((u) => h('li', {},
+      h('label', { class: 'person check' },
+        h('input', {
+          type: 'checkbox', checked: chosen.has(u.id),
+          onchange: (e) => { if (e.target.checked) chosen.add(u.id); else chosen.delete(u.id); },
+        }),
+        avatar(u.id, 'tiny'), h('span', {}, u.name), presenceDot(u.id)))));
+    if (!shown.length) list.append(h('li', { class: 'muted small' }, people.length ? 'Personne ne correspond.' : 'Tout le monde est déjà là.'));
+  };
+  filter.addEventListener('input', render);
+  render();
+  return {
+    el: h('div', { class: 'stack tight' }, people.length > 6 && filter, list),
+    selected: () => [...chosen],
+  };
+}
+
+async function openMembersDialog(c) {
+  let data;
+  try {
+    data = await api('GET', `/channels/${c.id}/members`);
+  } catch (err) {
+    report(err);
+    return;
+  }
+  const body = h('div', { class: 'stack' });
+  const dlg = dialog(`Membres de ${channelRef(c)}`, body);
+  const canRemove = c.createdBy === state.me.id || state.me.role === 'admin';
+
+  const render = () => {
+    const members = data.members
+      .map((id) => state.users.get(id) ?? { id, name: userName(id), email: '' })
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const isMember = data.members.includes(state.me.id);
+    const outsiders = [...state.users.values()].filter((u) => !data.members.includes(u.id));
+    const picker = peoplePicker(outsiders);
+
+    body.replaceChildren(...nodes(
+      h('p', { class: 'muted small' }, c.isPrivate
+        ? '🔒 Canal privé : seuls ses membres le voient et peuvent y ajouter des personnes.'
+        : 'Canal public : tout le monde peut le rejoindre.'),
+      h('ul', { class: 'pick-list' }, members.map((u) => h('li', {},
+        h('div', { class: 'person' }, avatar(u.id), h('div', {},
+          h('strong', {}, presenceDot(u.id), ' ', u.name, u.id === state.me.id ? ' (vous)' : ''),
+          h('div', { class: 'muted small' }, u.id === data.createdBy ? 'Créateur du canal' : u.email))),
+        u.id === state.me.id
+          ? h('button', { class: 'btn small', onclick: () => { dlg.close(); leaveChannel(c); } }, 'Quitter')
+          : canRemove && h('button', {
+            class: 'btn small danger',
+            onclick: async () => {
+              if (!confirm(`Retirer ${u.name} de ${channelRef(c)} ?`)) return;
+              try {
+                await api('DELETE', `/channels/${c.id}/members/${u.id}`);
+                data.members = data.members.filter((id) => id !== u.id);
+                render();
+              } catch (err) { report(err); }
+            },
+          }, 'Retirer')))),
+      isMember && outsiders.length > 0 && h('div', { class: 'stack' },
+        h('h3', {}, 'Ajouter des personnes'),
+        picker.el,
+        h('button', {
+          class: 'btn primary',
+          onclick: async () => {
+            const userIds = picker.selected();
+            if (!userIds.length) return;
+            try {
+              const res = await api('POST', `/channels/${c.id}/members`, { userIds });
+              data.members = res.members;
+              c.memberCount = res.members.length;
+              toast(`${res.added.length} personne${res.added.length > 1 ? 's' : ''} ajoutée${res.added.length > 1 ? 's' : ''}.`, 'info');
+              render();
+            } catch (err) { report(err); }
+          },
+        }, 'Ajouter')),
+      !isMember && !c.isPrivate && h('p', { class: 'muted small' }, 'Rejoignez le canal pour pouvoir y ajouter des personnes.')));
+  };
+  render();
+}
+
+// --- Historique des pages --------------------------------------------------------
+
+// Différence ligne à ligne (plus longue sous-séquence commune) entre deux textes.
+function diffLines(before, after) {
+  const a = before.split('\n');
+  const b = after.split('\n');
+  if (a.length * b.length > 4_000_000) return null;
+  const n = a.length;
+  const m = b.length;
+  const lcs = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+    }
+  }
+  const out = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { out.push({ type: 'same', text: a[i] }); i++; j++; }
+    else if (lcs[i + 1][j] >= lcs[i][j + 1]) out.push({ type: 'del', text: a[i++] });
+    else out.push({ type: 'add', text: b[j++] });
+  }
+  while (i < n) out.push({ type: 'del', text: a[i++] });
+  while (j < m) out.push({ type: 'add', text: b[j++] });
+  return out;
+}
+
+// Affiche les lignes modifiées avec 2 lignes de contexte ; les longues parties identiques sont repliées.
+function renderDiff(lines) {
+  if (!lines) return h('p', { class: 'muted' }, 'Page trop longue pour afficher les différences.');
+  if (!lines.some((l) => l.type !== 'same')) return h('p', { class: 'muted' }, 'Identique à la version actuelle.');
+  const keep = lines.map((l, i) => l.type !== 'same' || lines.slice(Math.max(0, i - 2), i + 3).some((x) => x.type !== 'same'));
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (!keep[i]) {
+      let k = i;
+      while (k < lines.length && !keep[k]) k++;
+      rows.push(h('div', { class: 'diff-gap' }, `… ${k - i} ligne${k - i > 1 ? 's' : ''} identique${k - i > 1 ? 's' : ''} …`));
+      i = k - 1;
+      continue;
+    }
+    const l = lines[i];
+    rows.push(h('div', { class: `diff-line ${l.type}` },
+      h('span', { class: 'diff-sign', 'aria-hidden': 'true' }, l.type === 'add' ? '+' : l.type === 'del' ? '−' : ' '),
+      h('span', {}, l.text || ' ')));
+  }
+  return h('div', { class: 'diff' }, rows);
+}
+
+async function openHistory(v) {
+  if (v.dirty || v.saving) await savePage(v);
+  if (v.conflict) {
+    toast('Réglez d’abord le conflit de modification en cours.');
+    return;
+  }
+  let data;
+  try {
+    data = await api('GET', `/pages/${v.id}/versions`);
+  } catch (err) {
+    report(err);
+    return;
+  }
+  const list = h('ul', { class: 'version-list' });
+  const preview = h('div', { class: 'version-preview' });
+  const dlg = dialog(`Historique de « ${pageTitle(v.page)} »`, h('div', { class: 'history' }, list, preview));
+  dlg.classList.add('wide');
+
+  if (!data.versions.length) {
+    list.replaceChildren(h('li', { class: 'muted small' }, 'Aucune version enregistrée pour l’instant.'));
+    preview.replaceChildren(h('p', { class: 'muted' }, 'L’historique se remplit à chaque modification de la page. Les enregistrements d’une même personne à moins de 10 minutes d’intervalle sont regroupés.'));
+    return;
+  }
+
+  let selected = null;
+  let mode = 'diff';
+  const isCurrent = (ver) => ver.version === data.current;
+
+  async function select(ver) {
+    selected = ver;
+    renderList();
+    preview.replaceChildren(h('p', { class: 'muted' }, 'Chargement…'));
+    try {
+      const full = (await api('GET', `/pages/${v.id}/versions/${ver.id}`)).version;
+      if (selected !== ver) return;
+      renderPreview(full);
+    } catch (err) { report(err); }
+  }
+
+  function renderList() {
+    list.replaceChildren(...data.versions.map((ver) => h('li', {},
+      h('button', { class: `version${ver === selected ? ' active' : ''}`, onclick: () => select(ver) },
+        avatar(ver.editedBy, 'tiny'),
+        h('span', { class: 'version-info' },
+          h('strong', {}, dateTimeFmt.format(ver.savedAt)),
+          h('span', { class: 'muted small' }, userName(ver.editedBy),
+            ver.restoredFrom ? ` · restauration de la v${ver.restoredFrom}` : '')),
+        isCurrent(ver) && h('span', { class: 'tag' }, 'Actuelle')))));
+  }
+
+  function renderPreview(full) {
+    const tabs = h('div', { class: 'tabs', role: 'tablist' },
+      ['diff', 'read'].map((m) => h('button', {
+        role: 'tab', class: `tab${mode === m ? ' active' : ''}`, 'aria-selected': mode === m ? 'true' : 'false',
+        onclick: () => { mode = m; renderPreview(full); },
+      }, m === 'diff' ? 'Changements' : 'Aperçu')));
+    const content = mode === 'diff'
+      ? h('div', {},
+        h('p', { class: 'muted small legend' }, h('span', { class: 'diff-key del' }, '−'), ' dans cette version uniquement · ',
+          h('span', { class: 'diff-key add' }, '+'), ' ajouté depuis'),
+        full.title !== v.page.title && h('p', { class: 'small' }, 'Titre : ', h('del', {}, full.title || 'Sans titre'), ' → ', h('strong', {}, pageTitle(v.page))),
+        renderDiff(diffLines(full.content, v.page.content)))
+      : h('div', {}, h('h1', { class: 'version-title' }, full.title || 'Sans titre'),
+        h('div', { class: 'md page-md', html: renderMarkdown(full.content) || '<p class="muted">Page vide.</p>' }));
+    preview.replaceChildren(
+      h('div', { class: 'version-head' }, tabs,
+        isCurrent(full)
+          ? h('span', { class: 'muted small' }, 'C’est la version actuelle.')
+          : h('button', {
+            class: 'btn small primary',
+            onclick: async () => {
+              if (!confirm('Restaurer cette version ? Le contenu actuel restera disponible dans l’historique.')) return;
+              try {
+                const { page } = await api('POST', `/pages/${v.id}/versions/${full.id}/restore`, { version: v.page.version });
+                Object.assign(v, { page, title: page.title, content: page.content, dirty: false });
+                const summary = state.pages.get(page.id);
+                if (summary) summary.title = page.title;
+                dlg.close();
+                renderSidebar();
+                renderPage(v);
+                toast('Version restaurée.', 'info');
+              } catch (err) { report(err); }
+            },
+          }, 'Restaurer cette version')),
+      content);
+  }
+
+  renderList();
+  select(data.versions.find((ver) => !isCurrent(ver)) ?? data.versions[0]);
+}
+
+// --- Application installable et notifications push ----------------------------
+
+const pushSupported = 'serviceWorker' in navigator && 'PushManager' in window && desktopSupported;
+let pushActive = false;
+
+function base64UrlToBytes(value) {
+  const base64 = (value + '='.repeat((4 - (value.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+}
+
+async function currentSubscription() {
+  if (!pushSupported) return null;
+  const registration = await navigator.serviceWorker.ready;
+  return registration.pushManager.getSubscription();
+}
+
+async function subscribePush() {
+  const { publicKey } = await api('GET', '/push/key');
+  if (!publicKey) return false;
+  const registration = await navigator.serviceWorker.ready;
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(publicKey) });
+  }
+  // Toujours renvoyé au serveur : l'abonnement est rattaché au compte connecté sur cet appareil.
+  await api('POST', '/push/subscribe', { subscription: subscription.toJSON() });
+  pushActive = true;
+  return true;
+}
+
+async function disablePush() {
+  const subscription = await currentSubscription();
+  pushActive = false;
+  if (!subscription) return;
+  await api('POST', '/push/unsubscribe', { endpoint: subscription.endpoint }).catch(() => {});
+  await subscription.unsubscribe();
+}
+
+// Au démarrage : si les notifications sont activées sur cet appareil, on (ré)associe l'abonnement au compte.
+async function syncPush() {
+  if (!pushSupported || Notification.permission !== 'granted' || !storage.get('makora.desktop', true)) return;
+  try { await subscribePush(); } catch (err) { console.warn('Abonnement push impossible :', err); }
+}
+
+async function enableDeviceNotifications() {
+  if (await Notification.requestPermission() !== 'granted') return;
+  storage.set('makora.desktop', true);
+  if (pushSupported) {
+    try {
+      if (!await subscribePush()) toast('Les notifications push ne sont pas configurées sur ce serveur.', 'info');
+    } catch (err) {
+      report(new Error(`Abonnement push impossible : ${err.message}`));
+    }
+  }
+}
+
+function deviceNotificationsControl(v) {
+  if (!desktopSupported) return null;
+  if (Notification.permission === 'denied') {
+    return h('span', { class: 'muted small' }, 'Notifications bloquées dans les réglages du navigateur');
+  }
+  const on = Notification.permission === 'granted' && storage.get('makora.desktop', true);
+  return h('button', {
+    class: 'btn small', 'aria-pressed': on ? 'true' : 'false',
+    title: pushSupported ? 'Notifications push, même application fermée' : 'Notifications quand l’onglet est ouvert en arrière-plan',
+    onclick: async (e) => {
+      e.currentTarget.disabled = true;
+      if (on) {
+        storage.set('makora.desktop', false);
+        await disablePush().catch(report);
+      } else {
+        await enableDeviceNotifications();
+      }
+      renderActivity(v);
+    },
+  }, on ? '🔔 Notifications sur cet appareil : activées' : '🔕 Activer les notifications sur cet appareil');
+}
+
+let installPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  if (state.view?.kind === 'activity') renderActivity(state.view);
+  renderSidebar();
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  renderSidebar();
+});
+
+function installButton() {
+  if (!installPrompt) return null;
+  return h('button', {
+    class: 'btn small primary',
+    onclick: async () => {
+      installPrompt.prompt();
+      await installPrompt.userChoice;
+      installPrompt = null;
+      renderSidebar();
+      if (state.view?.kind === 'activity') renderActivity(state.view);
+    },
+  }, '📲 Installer l’application');
+}
+
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+
+// Sur iPhone, les notifications push ne fonctionnent qu'une fois l'application ajoutée à l'écran d'accueil.
+function iosInstallTip() {
+  const ios = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!ios || isStandalone()) return null;
+  return h('div', { class: 'notice tip' }, '📲 Sur iPhone et iPad : touchez ', h('strong', {}, 'Partager'), ' puis ',
+    h('strong', {}, 'Sur l’écran d’accueil'), ' pour installer MAKORA HIT et recevoir les notifications.');
 }
 
 // --- Recherche --------------------------------------------------------------
@@ -1621,7 +2025,7 @@ async function openSearch(term) {
       results.replaceChildren(h('p', { class: 'muted' }, term.length < 2 ? 'Tapez au moins 2 caractères.' : 'Aucun résultat.'));
       return;
     }
-    results.replaceChildren(
+    results.replaceChildren(...nodes(
       pages.length > 0 && h('section', {}, h('h2', {}, 'Pages'), pages.map((p) => h('a', { class: 'result', href: `#/p/${p.id}` },
         h('strong', {}, '📄 ', pageTitle(p)), h('p', { class: 'muted small' }, p.excerpt)))),
       messages.length > 0 && h('section', {}, h('h2', {}, 'Messages'), messages.map((m) => {
@@ -1630,10 +2034,18 @@ async function openSearch(term) {
           h('div', { class: 'small' }, h('strong', {}, userName(m.userId)), ' dans ', c ? channelTitle(c) : 'un canal',
             ' · ', h('span', { class: 'muted' }, dateTimeFmt.format(m.createdAt))),
           h('div', { class: 'md', html: md(m.body) }));
-      })));
+      }))));
   } catch (err) {
     report(err);
   }
+}
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch((err) => console.warn('Service worker non enregistré :', err));
+  // Clic sur une notification alors que l'application est déjà ouverte.
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'navigate') location.hash = new URL(e.data.url).hash;
+  });
 }
 
 boot();

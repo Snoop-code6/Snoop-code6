@@ -29,13 +29,18 @@ export function createHub() {
     online() {
       return [...sockets.keys()];
     },
+    // Au moins un onglet de la personne est au premier plan (et non en arrière-plan ou gelé).
+    isActive(userId) {
+      return [...(sockets.get(userId) ?? [])].some((ws) => ws.visible !== false);
+    },
     sendTo(userIds, event) {
       for (const id of userIds) {
         for (const ws of sockets.get(id) ?? []) send(ws, event);
       }
     },
-    broadcast(event) {
-      for (const set of sockets.values()) {
+    broadcast(event, { except = [] } = {}) {
+      for (const [userId, set] of sockets) {
+        if (except.includes(userId)) continue;
         for (const ws of set) send(ws, event);
       }
     },
@@ -50,7 +55,7 @@ export function createHub() {
 }
 
 export function attachWebSocket(server, { db, hub }) {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 4096 });
 
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://localhost');
@@ -67,6 +72,15 @@ export function attachWebSocket(server, { db, hub }) {
       ws.isAlive = true;
       ws.on('pong', () => { ws.isAlive = true; });
       ws.on('close', () => hub.remove(user.id, ws));
+      // Le client signale s'il est au premier plan, pour décider s'il faut envoyer un push.
+      ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data);
+          if (msg.type === 'visibility') ws.visible = Boolean(msg.visible);
+        } catch {
+          // Message illisible : ignoré.
+        }
+      });
       hub.add(user.id, ws);
       ws.send(JSON.stringify({ type: 'presence', online: hub.online() }));
     });
