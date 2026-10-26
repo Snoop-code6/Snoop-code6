@@ -828,3 +828,140 @@ describe('push et visibilité', () => {
     ws.ws.close();
   });
 });
+
+describe('gestion des comptes', () => {
+  let ids;
+  // Client qui se connecte avec un mot de passe donné.
+  const loginAs = async (email, password) => {
+    const c = client();
+    const res = await c.call('POST', '/auth/login', { email, password });
+    return { c, status: res.status, data: res.data };
+  };
+
+  before(async () => {
+    ids = {
+      admin: (await admin.call('GET', '/me')).data.user.id,
+      bob: (await bob.call('GET', '/me')).data.user.id,
+      carol: (await carol.call('GET', '/me')).data.user.id,
+    };
+  });
+
+  test('l’administration est réservée aux admins', async () => {
+    assert.equal((await bob.call('GET', '/admin/users')).status, 403);
+    assert.equal((await bob.call('PATCH', `/admin/users/${ids.carol}`, { role: 'admin' })).status, 403);
+    const { users } = (await admin.call('GET', '/admin/users')).data;
+    assert.equal(users.length, 3);
+    assert.ok(users.every((u) => u.active && u.createdAt));
+  });
+
+  test('nommer puis retirer un administrateur', async () => {
+    const ws = socket(carol.cookie);
+    await ws.opened;
+    const res = await admin.call('PATCH', `/admin/users/${ids.bob}`, { role: 'admin' });
+    assert.equal(res.data.user.role, 'admin');
+    const ev = await ws.next((e) => e.type === 'user:updated' && e.user.id === ids.bob);
+    assert.equal(ev.user.role, 'admin');
+    ws.ws.close();
+    // Bob, désormais admin, a accès à l'administration.
+    assert.equal((await bob.call('GET', '/admin/users')).status, 200);
+    assert.equal((await bob.call('PATCH', `/admin/users/${ids.bob}`, { role: 'member' })).status, 400); // pas sur soi-même
+    assert.equal((await admin.call('PATCH', `/admin/users/${ids.bob}`, { role: 'member' })).data.user.role, 'member');
+    assert.equal((await admin.call('PATCH', `/admin/users/${ids.bob}`, { role: 'chef' })).status, 400);
+  });
+
+  test('impossible de se retirer ses propres droits ou de se désactiver', async () => {
+    assert.equal((await admin.call('PATCH', `/admin/users/${ids.admin}`, { role: 'member' })).status, 400);
+    assert.equal((await admin.call('PATCH', `/admin/users/${ids.admin}`, { active: false })).status, 400);
+    assert.equal((await admin.call('GET', '/me')).data.user.role, 'admin');
+  });
+
+  test('désactiver un compte coupe ses sessions et l’empêche de se connecter', async () => {
+    const carolSession = (await loginAs('carol@pme.fr', 'motdepasse3')).c;
+    const ws = socket(carolSession.cookie);
+    await ws.opened;
+    const closed = new Promise((resolve) => ws.ws.on('close', resolve));
+    await carolSession.call('POST', '/push/subscribe', { subscription: { endpoint: 'https://push.example/carol-desactivee', keys: { p256dh: 'B', auth: 'a' } } });
+
+    assert.equal((await admin.call('PATCH', `/admin/users/${ids.carol}`, { active: false })).data.user.active, false);
+    await closed;
+    assert.equal((await carolSession.call('GET', '/me')).status, 401);
+    const retry = await loginAs('carol@pme.fr', 'motdepasse3');
+    assert.equal(retry.status, 403);
+    assert.match(retry.data.error, /désactivé/);
+    assert.equal(srv.db.prepare('SELECT COUNT(*) AS n FROM push_subscriptions WHERE user_id = ?').get(ids.carol).n, 0);
+
+    // Plus de nouveau message privé ni d'ajout à un canal pour un compte désactivé.
+    assert.equal((await bob.call('POST', '/dms', { userId: ids.carol })).status, 404);
+    const general = (await bob.call('GET', '/channels')).data.channels.find((c) => c.name === 'general');
+    assert.equal((await bob.call('POST', `/channels/${general.id}/members`, { userIds: [ids.carol] })).status, 400);
+    // Son nom reste affiché sur ses anciens messages.
+    const listed = (await bob.call('GET', '/users')).data.users.find((u) => u.id === ids.carol);
+    assert.equal(listed.active, false);
+    assert.equal(listed.name, 'Carol Petit');
+  });
+
+  test('réactiver un compte', async () => {
+    await admin.call('PATCH', `/admin/users/${ids.carol}`, { active: true });
+    const again = await loginAs('carol@pme.fr', 'motdepasse3');
+    assert.equal(again.status, 200);
+    carol.call = again.c.call; // le client « carol » des autres tests reprend la nouvelle session
+    Object.defineProperty(carol, 'cookie', { get: () => again.c.cookie });
+  });
+
+  test('il reste toujours au moins un administrateur actif', async () => {
+    // Comme on ne peut pas toucher à ses propres droits, l'admin qui agit reste toujours admin.
+    await admin.call('PATCH', `/admin/users/${ids.bob}`, { role: 'admin' });
+    assert.equal((await bob.call('PATCH', `/admin/users/${ids.admin}`, { role: 'member' })).status, 200);
+    // Désormais Bob est le seul admin : Alice (simple membre) ne peut plus rien faire.
+    assert.equal((await admin.call('PATCH', `/admin/users/${ids.bob}`, { role: 'member' })).status, 403);
+    // Bob rend ses droits à Alice.
+    await bob.call('PATCH', `/admin/users/${ids.admin}`, { role: 'admin' });
+    await admin.call('PATCH', `/admin/users/${ids.bob}`, { role: 'member' });
+    assert.equal(srv.db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'").get().n, 1);
+  });
+
+  test('lien de réinitialisation à usage unique', async () => {
+    const bobOther = (await loginAs('bob@pme.fr', 'motdepasse2')).c;
+    const { token } = (await admin.call('POST', `/admin/users/${ids.bob}/reset`)).data;
+    assert.equal(token.length, 64);
+    // Seule l'empreinte du jeton est stockée.
+    assert.equal(srv.db.prepare('SELECT COUNT(*) AS n FROM password_resets WHERE token_hash = ?').get(token).n, 0);
+
+    const anon = client();
+    assert.deepEqual((await anon.call('GET', `/reset/${token}`)).data, { valid: true, name: 'Bob Durand' });
+    assert.equal((await anon.call('POST', '/auth/reset', { token, password: 'court' })).status, 400);
+    const ok = await anon.call('POST', '/auth/reset', { token, password: 'nouveau-mdp-bob' });
+    assert.equal(ok.status, 200);
+    assert.equal((await anon.call('GET', '/me')).data.user.id, ids.bob);
+    assert.equal((await bobOther.call('GET', '/me')).status, 401); // anciennes sessions fermées
+    assert.equal((await anon.call('POST', '/auth/reset', { token, password: 'encore-un-autre' })).status, 400);
+    assert.equal((await anon.call('GET', `/reset/${token}`)).data.valid, false);
+    assert.equal((await loginAs('bob@pme.fr', 'motdepasse2')).status, 401);
+    const fresh = await loginAs('bob@pme.fr', 'nouveau-mdp-bob');
+    assert.equal(fresh.status, 200);
+    bob.call = fresh.c.call;
+    Object.defineProperty(bob, 'cookie', { get: () => fresh.c.cookie });
+  });
+
+  test('changer son nom et son mot de passe', async () => {
+    assert.equal((await carol.call('PATCH', '/me', { name: '  Carol Petit-Martin ' })).data.user.name, 'Carol Petit-Martin');
+    assert.equal((await carol.call('PATCH', '/me', { name: '' })).status, 400);
+
+    const other = (await loginAs('carol@pme.fr', 'motdepasse3')).c;
+    assert.equal((await carol.call('POST', '/me/password', { current: 'mauvais', password: 'nouveau-mdp-carol' })).status, 400);
+    assert.equal((await carol.call('POST', '/me/password', { current: 'motdepasse3', password: 'nouveau-mdp-carol' })).status, 204);
+    assert.equal((await carol.call('GET', '/me')).status, 200); // la session en cours reste ouverte
+    assert.equal((await other.call('GET', '/me')).status, 401); // les autres appareils sont déconnectés
+    assert.equal((await loginAs('carol@pme.fr', 'nouveau-mdp-carol')).status, 200);
+    await carol.call('PATCH', '/me', { name: 'Carol Petit' });
+  });
+
+  test('invitations en attente : liste et révocation', async () => {
+    const { token } = (await admin.call('POST', '/invites')).data;
+    const { invites } = (await admin.call('GET', '/admin/invites')).data;
+    assert.ok(invites.some((i) => i.token === token));
+    assert.equal((await bob.call('GET', '/admin/invites')).status, 403);
+    assert.equal((await admin.call('DELETE', `/admin/invites/${token}`)).status, 204);
+    assert.equal((await client().call('GET', `/invites/${token}`)).data.valid, false);
+  });
+});

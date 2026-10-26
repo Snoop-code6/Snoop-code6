@@ -112,6 +112,7 @@ const state = {
 };
 
 const userName = (id) => state.users.get(id)?.name ?? 'Utilisateur supprimé';
+const activeColleagues = () => [...state.users.values()].filter((u) => u.id !== state.me.id && u.active !== false);
 const channelTitle = (c) => (c.isDm ? userName(c.dmUserId) : `${c.isPrivate ? '🔒' : '#'} ${c.name}`);
 const channelRef = (c) => (c.isPrivate ? `🔒${c.name}` : `#${c.name}`);
 const pageTitle = (p) => p?.title?.trim() || 'Sans titre';
@@ -161,13 +162,24 @@ async function boot() {
   }
 }
 
+// Un lien d'invitation ou de réinitialisation ouvert dans un onglet resté sur l'écran de connexion.
+window.addEventListener('hashchange', () => {
+  if (!state.started && /^#\/(invite|reset)\//.test(location.hash)) showAuth().catch(report);
+});
+
 async function showAuth() {
   const { needsSetup } = await api('GET', '/setup');
   const invite = location.hash.match(/^#\/invite\/([a-f0-9]+)$/)?.[1];
+  const resetToken = location.hash.match(/^#\/reset\/([a-f0-9]+)$/)?.[1];
   let mode = 'login';
   let notice = '';
+  let resetName = '';
   if (needsSetup) mode = 'setup';
-  else if (invite) {
+  else if (resetToken) {
+    const { valid, name } = await api('GET', `/reset/${resetToken}`);
+    if (valid) { mode = 'reset'; resetName = name; }
+    else notice = 'Ce lien de réinitialisation est invalide, déjà utilisé ou expiré. Demandez-en un nouveau à votre administrateur.';
+  } else if (invite) {
     const { valid } = await api('GET', `/invites/${invite}`);
     if (valid) mode = 'register';
     else notice = 'Ce lien d’invitation est invalide ou a expiré. Demandez-en un nouveau à votre administrateur.';
@@ -177,6 +189,7 @@ async function showAuth() {
     setup: ['Créer votre espace', 'Vous serez l’administrateur de l’espace MAKORA HIT de votre entreprise.'],
     register: ['Rejoindre l’équipe', 'Vous avez été invité·e. Créez votre compte pour commencer.'],
     login: ['Connexion', 'Retrouvez les discussions et documents de votre équipe.'],
+    reset: ['Nouveau mot de passe', `Bonjour ${resetName}, choisissez votre nouveau mot de passe.`],
   };
   const [title, subtitle] = titles[mode];
   const error = h('p', { class: 'form-error', role: 'alert' });
@@ -188,15 +201,17 @@ async function showAuth() {
     h('h1', {}, title),
     h('p', { class: 'muted' }, subtitle),
     notice && h('p', { class: 'notice' }, notice),
-    mode !== 'login' && field('Nom complet', 'name', 'text', { autocomplete: 'name', maxlength: 80 }),
-    field('Email professionnel', 'email', 'email', { autocomplete: 'email' }),
-    field('Mot de passe', 'password', 'password', {
+    (mode === 'setup' || mode === 'register') && field('Nom complet', 'name', 'text', { autocomplete: 'name', maxlength: 80 }),
+    mode !== 'reset' && field('Email professionnel', 'email', 'email', { autocomplete: 'email' }),
+    field(mode === 'reset' ? 'Nouveau mot de passe (8 caractères minimum)' : 'Mot de passe', 'password', 'password', {
       autocomplete: mode === 'login' ? 'current-password' : 'new-password',
       minlength: mode === 'login' ? undefined : 8,
     }),
     error,
-    h('button', { class: 'btn primary block', type: 'submit' }, mode === 'login' ? 'Se connecter' : 'Créer mon compte'),
+    h('button', { class: 'btn primary block', type: 'submit' },
+      { login: 'Se connecter', reset: 'Enregistrer et me connecter' }[mode] ?? 'Créer mon compte'),
     mode === 'login' && h('p', { class: 'muted small' }, 'Pas de compte ? Demandez un lien d’invitation à votre administrateur.'),
+    mode === 'login' && h('p', { class: 'muted small' }, 'Mot de passe oublié ? Votre administrateur peut vous envoyer un lien de réinitialisation.'),
   );
 
   form.addEventListener('submit', async (e) => {
@@ -206,8 +221,8 @@ async function showAuth() {
     button.disabled = true;
     error.textContent = '';
     try {
-      const path = mode === 'login' ? '/auth/login' : '/auth/register';
-      const { user } = await api('POST', path, { ...data, invite });
+      const path = { login: '/auth/login', reset: '/auth/reset' }[mode] ?? '/auth/register';
+      const { user } = await api('POST', path, { ...data, invite, token: resetToken });
       state.me = user;
       history.replaceState(null, '', location.pathname);
       await startApp();
@@ -265,7 +280,12 @@ function connect() {
   socket.addEventListener('message', (e) => {
     try { onEvent(JSON.parse(e.data)); } catch (err) { console.error(err); }
   });
-  socket.addEventListener('close', () => {
+  socket.addEventListener('close', (e) => {
+    // 4001 : session fermée par le serveur (compte désactivé, mot de passe réinitialisé).
+    if (e.code === 4001) {
+      location.reload();
+      return;
+    }
     document.body.classList.add('offline');
     const delay = Math.min(30_000, 1000 * 2 ** retry++);
     setTimeout(connect, delay);
@@ -300,6 +320,22 @@ function onEvent(ev) {
       renderSidebar();
       if (v?.kind === 'channel') renderChannelHeader(v);
       break;
+    case 'user:updated': {
+      state.users.set(ev.user.id, ev.user);
+      if (ev.user.id === state.me.id) {
+        const roleChanged = ev.user.role !== state.me.role;
+        Object.assign(state.me, { name: ev.user.name, role: ev.user.role });
+        renderMe();
+        if (roleChanged) {
+          toast(ev.user.role === 'admin' ? 'Vous êtes maintenant administrateur.' : 'Vous n’êtes plus administrateur.', 'info');
+          if (v?.kind === 'admin' && ev.user.role !== 'admin') location.hash = '';
+        }
+      }
+      renderSidebar();
+      if (v?.kind === 'admin') loadAdmin(v);
+      else if (v?.kind === 'channel') rerender(v);
+      break;
+    }
     case 'user:new':
       state.users.set(ev.user.id, ev.user);
       break;
@@ -434,16 +470,21 @@ function renderShell() {
         section('Canaux', els.channels, openChannelDialog, 'Créer ou rejoindre un canal'),
         section('Messages privés', els.dms, openDmDialog, 'Nouveau message privé'),
         section('Pages', els.pages, () => createPage(null), 'Nouvelle page')),
-      h('div', { class: 'me' },
-        avatar(me.id),
-        h('div', { class: 'me-info' }, h('strong', {}, me.name), h('span', { class: 'muted small' }, me.role === 'admin' ? 'Administrateur' : 'Membre')),
-        me.role === 'admin' && h('button', { class: 'btn small', onclick: createInvite }, 'Inviter'),
-        h('button', { class: 'btn small', title: 'Se déconnecter', onclick: logout }, 'Sortir'))),
+      els.me = h('button', { class: 'me', onclick: openAccountDialog, title: 'Mon compte' })),
     h('div', { class: 'backdrop', onclick: closeNav }),
     els.main,
   );
   root.replaceChildren(els.shell);
+  renderMe();
   renderSidebar();
+}
+
+function renderMe() {
+  const me = state.me;
+  els.me.replaceChildren(
+    avatar(me.id),
+    h('span', { class: 'me-info' }, h('strong', {}, me.name), h('span', { class: 'muted small' }, me.role === 'admin' ? 'Administrateur' : 'Membre')),
+    h('span', { class: 'me-gear', 'aria-hidden': 'true' }, '⚙'));
 }
 
 const toggleNav = () => els.shell.classList.toggle('nav-open');
@@ -469,7 +510,8 @@ function renderSidebar() {
 
   els.dms.replaceChildren(...all.filter((c) => c.isDm)
     .sort((a, b) => userName(a.dmUserId).localeCompare(userName(b.dmUserId)))
-    .map((c) => channelItem(c, h('span', { class: 'label' }, presenceDot(c.dmUserId), userName(c.dmUserId)))));
+    .map((c) => channelItem(c, h('span', { class: 'label' }, presenceDot(c.dmUserId), userName(c.dmUserId),
+      state.users.get(c.dmUserId)?.active === false && h('span', { class: 'muted small' }, ' (désactivé)')))));
   if (!els.dms.children.length) els.dms.append(h('li', { class: 'muted small empty' }, 'Aucune conversation'));
 
   const children = groupPages();
@@ -545,6 +587,11 @@ function route() {
   else if ((m = hash.match(/^#\/p\/(\d+)$/))) openPage(Number(m[1]));
   else if ((m = hash.match(/^#\/search\/(.+)$/))) openSearch(decodeURIComponent(m[1]));
   else if (hash === '#/activity') openActivity();
+  else if (hash === '#/admin' && state.me.role === 'admin') openAdmin();
+  else if (hash.startsWith('#/reset/') || hash.startsWith('#/invite/')) {
+    toast('Ce lien est destiné à une personne non connectée. Déconnectez-vous pour l’utiliser.', 'info');
+    location.replace('#/');
+  }
   else {
     const home = [...state.channels.values()].find((c) => c.name === 'general' && c.joined)
       ?? [...state.channels.values()].find((c) => c.joined);
@@ -1099,7 +1146,7 @@ function dialog(title, ...content) {
 
 function openChannelDialog() {
   const error = h('p', { class: 'form-error', role: 'alert' });
-  const people = peoplePicker([...state.users.values()].filter((u) => u.id !== state.me.id));
+  const people = peoplePicker(activeColleagues());
   const form = h('form', { class: 'stack' },
     h('label', { class: 'field' }, h('span', {}, 'Nom du canal'),
       h('input', { name: 'name', required: true, maxlength: 40, placeholder: 'ex. commercial, projet-alpha' })),
@@ -1142,7 +1189,7 @@ function openChannelDialog() {
 }
 
 function openDmDialog() {
-  const people = [...state.users.values()].filter((u) => u.id !== state.me.id);
+  const people = activeColleagues();
   const dlg = dialog('Nouveau message privé',
     people.length
       ? h('ul', { class: 'pick-list' }, people.map((u) => h('li', {},
@@ -1165,25 +1212,29 @@ async function openDm(userId) {
 async function createInvite() {
   try {
     const { token, expiresAt } = await api('POST', '/invites');
-    const link = `${location.origin}/#/invite/${token}`;
-    const input = h('input', { value: link, readonly: true, class: 'mono', 'aria-label': 'Lien d’invitation' });
-    dialog('Inviter un collègue',
-      h('p', {}, 'Envoyez ce lien à la personne à inviter. Il ne peut servir qu’une fois et expire le ',
-        h('strong', {}, dateTimeFmt.format(expiresAt)), '.'),
-      h('div', { class: 'row' }, input,
-        h('button', {
-          class: 'btn primary',
-          onclick: async () => {
-            try {
-              await navigator.clipboard.writeText(link);
-              toast('Lien copié.', 'info');
-            } catch {
-              input.select();
-            }
-          },
-        }, 'Copier')));
-    input.select();
+    showLink('Inviter un collègue', 'Envoyez ce lien à la personne à inviter. Il ne peut servir qu’une fois et expire le ',
+      `${location.origin}/#/invite/${token}`, expiresAt);
+    if (state.view?.kind === 'admin') loadAdmin(state.view);
   } catch (err) { report(err); }
+}
+
+function showLink(title, intro, link, expiresAt) {
+  const input = h('input', { value: link, readonly: true, class: 'mono', 'aria-label': 'Lien à envoyer' });
+  dialog(title,
+    h('p', {}, intro, h('strong', {}, dateTimeFmt.format(expiresAt)), '.'),
+    h('div', { class: 'row' }, input,
+      h('button', {
+        class: 'btn primary',
+        onclick: async () => {
+          try {
+            await navigator.clipboard.writeText(link);
+            toast('Lien copié.', 'info');
+          } catch {
+            input.select();
+          }
+        },
+      }, 'Copier')));
+  input.select();
 }
 
 // --- Pages -----------------------------------------------------------------
@@ -1460,7 +1511,7 @@ function mentionPicker(input) {
   function candidates(query) {
     const q = query.toLowerCase();
     const people = [...state.users.values()]
-      .filter((u) => u.id !== state.me.id)
+      .filter((u) => u.id !== state.me.id && u.active !== false)
       .filter((u) => u.name.toLowerCase().startsWith(q) || u.name.toLowerCase().split(/\s+/).some((w) => w.startsWith(q)))
       .slice(0, 6)
       .map((u) => ({ value: u.name, label: u.name, id: u.id }));
@@ -1707,7 +1758,7 @@ async function openMembersDialog(c) {
       .map((id) => state.users.get(id) ?? { id, name: userName(id), email: '' })
       .sort((a, b) => a.name.localeCompare(b.name));
     const isMember = data.members.includes(state.me.id);
-    const outsiders = [...state.users.values()].filter((u) => !data.members.includes(u.id));
+    const outsiders = [...state.users.values()].filter((u) => !data.members.includes(u.id) && u.active !== false);
     const picker = peoplePicker(outsiders);
 
     body.replaceChildren(...nodes(
@@ -2006,6 +2057,166 @@ function iosInstallTip() {
   if (!ios || isStandalone()) return null;
   return h('div', { class: 'notice tip' }, '📲 Sur iPhone et iPad : touchez ', h('strong', {}, 'Partager'), ' puis ',
     h('strong', {}, 'Sur l’écran d’accueil'), ' pour installer MAKORA HIT et recevoir les notifications.');
+}
+
+// --- Mon compte -----------------------------------------------------------------
+
+function openAccountDialog() {
+  closeNav();
+  const me = state.me;
+  const nameError = h('p', { class: 'form-error', role: 'alert' });
+  const nameForm = h('form', { class: 'stack' },
+    h('label', { class: 'field' }, h('span', {}, 'Nom affiché'),
+      h('input', { name: 'name', value: me.name, required: true, maxlength: 80, autocomplete: 'name' })),
+    nameError,
+    h('button', { class: 'btn', type: 'submit' }, 'Enregistrer le nom'));
+  nameForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    nameError.textContent = '';
+    try {
+      const { user } = await api('PATCH', '/me', { name: new FormData(nameForm).get('name') });
+      state.me.name = user.name;
+      renderMe();
+      toast('Nom mis à jour.', 'info');
+    } catch (err) { nameError.textContent = err.message; }
+  });
+
+  const pwError = h('p', { class: 'form-error', role: 'alert' });
+  const pwForm = h('form', { class: 'stack' },
+    h('label', { class: 'field' }, h('span', {}, 'Mot de passe actuel'),
+      h('input', { name: 'current', type: 'password', required: true, autocomplete: 'current-password' })),
+    h('label', { class: 'field' }, h('span', {}, 'Nouveau mot de passe (8 caractères minimum)'),
+      h('input', { name: 'password', type: 'password', required: true, minlength: 8, autocomplete: 'new-password' })),
+    pwError,
+    h('button', { class: 'btn', type: 'submit' }, 'Changer le mot de passe'),
+    h('p', { class: 'muted small' }, 'Vos autres appareils seront déconnectés.'));
+  pwForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    pwError.textContent = '';
+    const data = new FormData(pwForm);
+    try {
+      await api('POST', '/me/password', { current: data.get('current'), password: data.get('password') });
+      pwForm.reset();
+      toast('Mot de passe modifié.', 'info');
+    } catch (err) { pwError.textContent = err.message; }
+  });
+
+  const dlg = dialog('Mon compte',
+    h('div', { class: 'account-head' }, avatar(me.id), h('div', {},
+      h('strong', {}, me.name), h('div', { class: 'muted small' }, me.email, ' · ', me.role === 'admin' ? 'Administrateur' : 'Membre'))),
+    me.role === 'admin' && h('div', { class: 'row wrap' },
+      h('button', { class: 'btn primary', onclick: () => { dlg.close(); location.hash = '#/admin'; } }, '🛠 Administration'),
+      h('button', { class: 'btn', onclick: () => { dlg.close(); createInvite(); } }, 'Inviter un collègue')),
+    h('h3', {}, 'Profil'), nameForm,
+    h('h3', {}, 'Mot de passe'), pwForm,
+    h('hr'),
+    h('button', { class: 'btn danger block', onclick: logout }, 'Se déconnecter'));
+}
+
+// --- Administration ---------------------------------------------------------------
+
+function openAdmin() {
+  const v = { kind: 'admin', users: [], invites: [] };
+  state.view = v;
+  renderSidebar();
+  v.body = h('div', { class: 'admin' }, h('p', { class: 'muted' }, 'Chargement…'));
+  els.main.replaceChildren(
+    h('header', { class: 'main-head' }, navButton(),
+      h('div', { class: 'head-title' }, h('h1', {}, '🛠 Administration'),
+        h('span', { class: 'muted small' }, 'Comptes de l’équipe et invitations')),
+      h('div', { class: 'head-actions' }, h('button', { class: 'btn small primary', onclick: createInvite }, '+ Inviter'))),
+    h('div', { class: 'page-scroll' }, v.body));
+  loadAdmin(v);
+}
+
+async function loadAdmin(v) {
+  try {
+    const [{ users }, { invites }] = await Promise.all([api('GET', '/admin/users'), api('GET', '/admin/invites')]);
+    if (state.view !== v) return;
+    v.users = users;
+    v.invites = invites;
+    renderAdmin(v);
+  } catch (err) {
+    report(err);
+    if (err.status === 403) location.hash = '';
+  }
+}
+
+async function adminAction(v, request, success) {
+  try {
+    await request();
+    if (success) toast(success, 'info');
+  } catch (err) { report(err); }
+  loadAdmin(v);
+}
+
+function renderAdmin(v) {
+  const active = v.users.filter((u) => u.active);
+  const admins = active.filter((u) => u.role === 'admin').length;
+
+  const userRow = (u) => {
+    const self = u.id === state.me.id;
+    const actions = self ? [h('span', { class: 'muted small' }, 'C’est vous')] : [
+      u.active && h('button', {
+        class: 'btn small',
+        onclick: () => adminAction(v, () => api('PATCH', `/admin/users/${u.id}`, { role: u.role === 'admin' ? 'member' : 'admin' }),
+          u.role === 'admin' ? `${u.name} n’est plus administrateur.` : `${u.name} est maintenant administrateur.`),
+      }, u.role === 'admin' ? 'Retirer les droits admin' : 'Nommer admin'),
+      u.active && h('button', {
+        class: 'btn small',
+        onclick: async () => {
+          try {
+            const { token, expiresAt } = await api('POST', `/admin/users/${u.id}/reset`);
+            showLink(`Réinitialiser le mot de passe de ${u.name}`,
+              `Envoyez ce lien à ${u.name} : il·elle pourra choisir un nouveau mot de passe, et ses sessions ouvertes seront fermées. Lien à usage unique, valable jusqu’au `,
+              `${location.origin}/#/reset/${token}`, expiresAt);
+          } catch (err) { report(err); }
+        },
+      }, 'Lien de réinitialisation'),
+      h('button', {
+        class: `btn small${u.active ? ' danger' : ''}`,
+        onclick: () => {
+          if (u.active && !confirm(`Désactiver le compte de ${u.name} ? Il·elle sera déconnecté·e immédiatement et ne pourra plus se connecter. Ses messages restent visibles.`)) return;
+          adminAction(v, () => api('PATCH', `/admin/users/${u.id}`, { active: !u.active }),
+            u.active ? `Compte de ${u.name} désactivé.` : `Compte de ${u.name} réactivé.`);
+        },
+      }, u.active ? 'Désactiver' : 'Réactiver'),
+    ];
+    return h('li', { class: `admin-user${u.active ? '' : ' inactive'}` },
+      h('div', { class: 'person' }, avatar(u.id), h('div', {},
+        h('strong', {}, u.active && presenceDot(u.id), ' ', u.name,
+          u.role === 'admin' && h('span', { class: 'tag' }, 'Admin'),
+          !u.active && h('span', { class: 'tag muted-tag' }, 'Désactivé')),
+        h('div', { class: 'muted small' }, u.email, ' · arrivé le ', dayFmt.format(u.createdAt)))),
+      h('div', { class: 'admin-actions' }, actions));
+  };
+
+  v.body.replaceChildren(...nodes(
+    h('section', {},
+      h('h2', {}, `Membres (${active.length} actif${active.length > 1 ? 's' : ''}, ${admins} admin${admins > 1 ? 's' : ''})`),
+      h('ul', { class: 'admin-list' }, v.users.map(userRow))),
+    h('section', {},
+      h('h2', {}, 'Invitations en attente'),
+      v.invites.length
+        ? h('ul', { class: 'admin-list' }, v.invites.map((i) => h('li', { class: 'admin-user' },
+          h('div', {}, h('strong', {}, `Invitation de ${userName(i.createdBy)}`),
+            h('div', { class: 'muted small' }, `créée le ${dateTimeFmt.format(i.createdAt)} · expire le ${dateTimeFmt.format(i.expiresAt)}`)),
+          h('div', { class: 'admin-actions' },
+            h('button', {
+              class: 'btn small',
+              onclick: () => showLink('Lien d’invitation', 'Lien à usage unique, valable jusqu’au ', `${location.origin}/#/invite/${i.token}`, i.expiresAt),
+            }, 'Afficher le lien'),
+            h('button', {
+              class: 'btn small danger',
+              onclick: () => adminAction(v, () => api('DELETE', `/admin/invites/${i.token}`), 'Invitation révoquée.'),
+            }, 'Révoquer')))))
+        : h('p', { class: 'muted' }, 'Aucune invitation en attente.')),
+    h('section', {},
+      h('h2', {}, 'Bon à savoir'),
+      h('ul', { class: 'muted small tips' },
+        h('li', {}, 'Un compte désactivé est déconnecté partout immédiatement ; ses messages et pages restent visibles.'),
+        h('li', {}, 'Il reste toujours au moins un administrateur, et personne ne peut retirer ses propres droits.'),
+        h('li', {}, 'Les administrateurs ne voient pas les canaux privés dont ils ne sont pas membres.')))));
 }
 
 // --- Recherche --------------------------------------------------------------

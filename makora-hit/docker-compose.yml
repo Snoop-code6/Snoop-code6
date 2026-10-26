@@ -1,0 +1,34 @@
+# Mise en ligne en une commande, HTTPS compris :
+#   DOMAIN=chat.mon-entreprise.fr docker compose up -d
+# Le nom de domaine doit pointer vers ce serveur (ports 80 et 443 ouverts).
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      TRUST_PROXY: "1"
+      # Facultatif : contact transmis aux services de notifications push.
+      # VAPID_SUBJECT: "mailto:it@mon-entreprise.fr"
+    volumes:
+      - makora-data:/data
+
+  # Caddy obtient et renouvelle automatiquement le certificat HTTPS (Let's Encrypt).
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?Indiquez votre nom de domaine, ex. DOMAIN=chat.mon-entreprise.fr}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  makora-data:
+  caddy-data:
+  caddy-config:

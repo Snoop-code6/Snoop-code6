@@ -3,7 +3,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  clearSessionCookie, createSession, deleteSession, hashPassword, newToken,
+  clearSessionCookie, createSession, deleteSession, hashPassword, hashToken, newToken,
   parseCookies, SESSION_COOKIE, sessionCookie, userFromToken, verifyPassword,
 } from './auth.js';
 import { transaction } from './db.js';
@@ -11,6 +11,7 @@ import { mentionRegex } from '../public/markdown.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
+const RESET_TTL_MS = 24 * 3600 * 1000;
 const PAGE_SIZE = 50;
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -47,7 +48,7 @@ function intParam(value) {
   return n;
 }
 
-const toUser = (u) => ({ id: u.id, email: u.email, name: u.name, role: u.role });
+const toUser = (u) => ({ id: u.id, email: u.email, name: u.name, role: u.role, active: !u.deactivated_at });
 const THREAD_STATS = `
   (SELECT COUNT(*) FROM messages r WHERE r.parent_id = m.id) AS reply_count,
   (SELECT MAX(r.created_at) FROM messages r WHERE r.parent_id = m.id) AS last_reply_at`;
@@ -121,9 +122,27 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
     userCount: db.prepare('SELECT COUNT(*) AS n FROM users'),
     userByEmail: db.prepare('SELECT * FROM users WHERE email = ?'),
     insertUser: db.prepare('INSERT INTO users (email, name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)'),
-    users: db.prepare('SELECT id, email, name, role FROM users ORDER BY name COLLATE NOCASE'),
+    users: db.prepare('SELECT id, email, name, role, deactivated_at FROM users ORDER BY name COLLATE NOCASE'),
+    activeUsers: db.prepare('SELECT id, email, name, role FROM users WHERE deactivated_at IS NULL ORDER BY name COLLATE NOCASE'),
+    adminUsers: db.prepare('SELECT id, email, name, role, deactivated_at, created_at FROM users ORDER BY name COLLATE NOCASE'),
+    fullUser: db.prepare('SELECT * FROM users WHERE id = ?'),
+    activeAdmins: db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND deactivated_at IS NULL"),
+    setRole: db.prepare('UPDATE users SET role = ? WHERE id = ?'),
+    setActive: db.prepare('UPDATE users SET deactivated_at = ? WHERE id = ?'),
+    setName: db.prepare('UPDATE users SET name = ? WHERE id = ?'),
+    setPassword: db.prepare('UPDATE users SET password_hash = ? WHERE id = ?'),
+    deleteSessions: db.prepare('DELETE FROM sessions WHERE user_id = ?'),
+    deleteOtherSessions: db.prepare('DELETE FROM sessions WHERE user_id = ? AND token != ?'),
+    deleteUserPushSubscriptions: db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?'),
+    insertReset: db.prepare('INSERT INTO password_resets (token_hash, user_id, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)'),
+    reset: db.prepare(`SELECT r.*, u.name, u.deactivated_at FROM password_resets r JOIN users u ON u.id = r.user_id
+      WHERE r.token_hash = ?`),
+    useReset: db.prepare('UPDATE password_resets SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'),
+    pendingInvites: db.prepare(`SELECT token, created_by, created_at, expires_at FROM invites
+      WHERE used_by IS NULL AND expires_at > ? ORDER BY created_at DESC`),
+    deleteInvite: db.prepare('DELETE FROM invites WHERE token = ? AND used_by IS NULL'),
     userName: db.prepare('SELECT name FROM users WHERE id = ?'),
-    userById: db.prepare('SELECT id FROM users WHERE id = ?'),
+    userById: db.prepare('SELECT id FROM users WHERE id = ? AND deactivated_at IS NULL'),
     invite: db.prepare('SELECT * FROM invites WHERE token = ?'),
     insertInvite: db.prepare('INSERT INTO invites (token, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)'),
     useInvite: db.prepare('UPDATE invites SET used_by = ? WHERE token = ? AND used_by IS NULL'),
@@ -354,7 +373,7 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
   // Une seule notification par personne et par message : la mention l'emporte sur la réponse dans un fil.
   function notifyForMessage(message, channel, author) {
     const targets = new Map();
-    const users = q.users.all();
+    const users = q.activeUsers.all();
     const names = [...users.map((u) => u.name), EVERYONE];
     for (const match of message.body.matchAll(mentionRegex(names))) {
       const name = match[2].toLowerCase();
@@ -464,9 +483,44 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
       limiter.failed(key);
       fail(401, 'Email ou mot de passe incorrect.');
     }
+    if (user.deactivated_at) fail(403, 'Ce compte a été désactivé. Contactez votre administrateur.');
     limiter.succeeded(key);
     login(req, res, user.id);
     res.json({ user: toUser(user) });
+  });
+
+  // --- Réinitialisation du mot de passe (lien créé par un administrateur) -----
+
+  function validPassword(password) {
+    if (typeof password !== 'string' || password.length < 8) fail(400, 'Le mot de passe doit faire au moins 8 caractères.');
+    if (password.length > 200) fail(400, 'Mot de passe trop long.');
+    return password;
+  }
+
+  function usableReset(token) {
+    const reset = q.reset.get(hashToken(String(token ?? '')));
+    if (!reset || reset.used_at || reset.expires_at < Date.now() || reset.deactivated_at) return null;
+    return reset;
+  }
+
+  api.get('/reset/:token', (req, res) => {
+    const reset = usableReset(req.params.token);
+    res.json({ valid: Boolean(reset), name: reset?.name ?? null });
+  });
+
+  api.post('/auth/reset', (req, res) => {
+    const password = validPassword(req.body?.password);
+    const reset = usableReset(req.body?.token);
+    if (!reset) fail(400, 'Ce lien de réinitialisation est invalide, déjà utilisé ou expiré.');
+    transaction(db, () => {
+      if (q.useReset.run(Date.now(), reset.token_hash).changes === 0) fail(400, 'Ce lien a déjà été utilisé.');
+      q.setPassword.run(hashPassword(password), reset.user_id);
+      // Toutes les sessions ouvertes avec l'ancien mot de passe sont fermées.
+      q.deleteSessions.run(reset.user_id);
+    });
+    hub.disconnect(reset.user_id);
+    login(req, res, reset.user_id);
+    res.json({ user: toUser(q.fullUser.get(reset.user_id)) });
   });
 
   api.post('/auth/logout', (req, res) => {
@@ -478,6 +532,83 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
   api.use(requireUser);
 
   api.get('/me', (req, res) => res.json({ user: req.user, limits: { maxUploadBytes: MAX_UPLOAD_BYTES, maxAttachments: MAX_ATTACHMENTS } }));
+
+  // --- Mon compte ----------------------------------------------------------
+
+  const broadcastUser = (id) => hub.broadcast({ type: 'user:updated', user: toUser(q.fullUser.get(id)) });
+
+  api.patch('/me', (req, res) => {
+    const name = text(req.body?.name, 'nom', { min: 1, max: 80 });
+    q.setName.run(name, req.user.id);
+    broadcastUser(req.user.id);
+    res.json({ user: toUser(q.fullUser.get(req.user.id)) });
+  });
+
+  api.post('/me/password', (req, res) => {
+    const user = q.fullUser.get(req.user.id);
+    if (!verifyPassword(String(req.body?.current ?? ''), user.password_hash)) fail(400, 'Mot de passe actuel incorrect.');
+    const password = validPassword(req.body?.password);
+    q.setPassword.run(hashPassword(password), user.id);
+    // Les autres appareils sont déconnectés ; la session en cours est conservée.
+    q.deleteOtherSessions.run(user.id, parseCookies(req.headers.cookie)[SESSION_COOKIE]);
+    res.status(204).end();
+  });
+
+  // --- Administration ------------------------------------------------------
+
+  api.get('/admin/users', requireAdmin, (req, res) => {
+    res.json({
+      users: q.adminUsers.all().map((u) => ({ ...toUser(u), createdAt: u.created_at, deactivatedAt: u.deactivated_at })),
+      online: hub.online(),
+    });
+  });
+
+  api.patch('/admin/users/:id', requireAdmin, (req, res) => {
+    const user = q.fullUser.get(intParam(req.params.id));
+    if (!user) fail(404, 'Utilisateur introuvable.');
+    const { role, active } = req.body ?? {};
+    if (role !== undefined && !['admin', 'member'].includes(role)) fail(400, 'Rôle invalide.');
+    if (active !== undefined && typeof active !== 'boolean') fail(400, 'Statut invalide.');
+    if (user.id === req.user.id && (role === 'member' || active === false)) {
+      fail(400, 'Vous ne pouvez pas retirer vos propres droits ni désactiver votre compte.');
+    }
+    transaction(db, () => {
+      if (role !== undefined) q.setRole.run(role, user.id);
+      if (active !== undefined) q.setActive.run(active ? null : (user.deactivated_at ?? Date.now()), user.id);
+      // Il doit toujours rester au moins un administrateur actif.
+      if (q.activeAdmins.get().n === 0) fail(400, 'Il doit rester au moins un administrateur actif.');
+      if (active === false) {
+        q.deleteSessions.run(user.id);
+        q.deleteUserPushSubscriptions.run(user.id);
+      }
+    });
+    if (active === false) hub.disconnect(user.id);
+    broadcastUser(user.id);
+    res.json({ user: toUser(q.fullUser.get(user.id)) });
+  });
+
+  api.post('/admin/users/:id/reset', requireAdmin, (req, res) => {
+    const user = q.fullUser.get(intParam(req.params.id));
+    if (!user) fail(404, 'Utilisateur introuvable.');
+    if (user.deactivated_at) fail(400, 'Réactivez d’abord ce compte.');
+    const token = newToken();
+    const now = Date.now();
+    q.insertReset.run(hashToken(token), user.id, req.user.id, now, now + RESET_TTL_MS);
+    res.status(201).json({ token, expiresAt: now + RESET_TTL_MS });
+  });
+
+  api.get('/admin/invites', requireAdmin, (req, res) => {
+    res.json({
+      invites: q.pendingInvites.all(Date.now()).map((i) => ({
+        token: i.token, createdBy: i.created_by, createdAt: i.created_at, expiresAt: i.expires_at,
+      })),
+    });
+  });
+
+  api.delete('/admin/invites/:token', requireAdmin, (req, res) => {
+    if (q.deleteInvite.run(req.params.token).changes === 0) fail(404, 'Invitation introuvable ou déjà utilisée.');
+    res.status(204).end();
+  });
 
   api.get('/users', (req, res) => {
     res.json({ users: q.users.all().map(toUser), online: hub.online() });

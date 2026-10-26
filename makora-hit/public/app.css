@@ -628,6 +628,27 @@ span.avatar.tiny:not([style]) { background: var(--muted); }
 .nav-item.install { width: 100%; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; margin-top: 2px; }
 .notice.tip { margin: 0 0 12px; }
 
+/* --- Mon compte et administration --- */
+
+button.me { width: 100%; border: 0; border-top: 1px solid rgb(255 255 255 / 8%); background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+button.me:hover { background: var(--sidebar-hover); }
+.me-gear { opacity: .6; font-size: 16px; }
+.account-head { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.row.wrap { flex-wrap: wrap; }
+.dialog hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
+.btn.danger.block { border-color: var(--danger); }
+.admin { max-width: 900px; margin: 0 auto; padding: 16px 24px 60px; }
+.admin h2 { font-size: 15px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 24px 0 8px; }
+.admin-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--radius); }
+.admin-user { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px; flex-wrap: wrap; }
+.admin-user + .admin-user { border-top: 1px solid var(--border); }
+.admin-user.inactive { opacity: .6; }
+.admin-user .tag { margin-left: 6px; vertical-align: 1px; }
+.muted-tag { background: var(--muted); }
+.admin-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.tips { padding-left: 18px; }
+.tips li { margin-bottom: 4px; }
+
 /* --- Fenêtres et notifications --- */
 
 .dialog {
@@ -687,6 +708,8 @@ body.offline .main-head::after {
   .search-results { padding: 12px 16px 40px; }
   .add-sub { opacity: .6; }
   .reaction.add { opacity: 1; }
+  .admin { padding: 12px 16px 40px; }
+  .admin-actions { justify-content: flex-start; }
   .mention-picker { left: 16px; right: 16px; }
 }
 

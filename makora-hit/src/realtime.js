@@ -44,6 +44,10 @@ export function createHub() {
         for (const ws of set) send(ws, event);
       }
     },
+    // Ferme toutes les connexions d'une personne (compte désactivé, mot de passe réinitialisé).
+    disconnect(userId) {
+      for (const ws of sockets.get(userId) ?? []) ws.close(4001, 'Session terminée');
+    },
     closeAll() {
       for (const set of sockets.values()) {
         for (const ws of set) ws.terminate();

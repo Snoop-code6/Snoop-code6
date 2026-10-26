@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export const SESSION_COOKIE = 'makora_session';
 const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
@@ -21,6 +21,8 @@ export function newToken() {
   return randomBytes(32).toString('hex');
 }
 
+export const hashToken = (token) => createHash('sha256').update(token).digest('hex');
+
 export function createSession(db, userId) {
   const token = newToken();
   const expiresAt = Date.now() + SESSION_TTL_MS;
@@ -37,7 +39,7 @@ export function userFromToken(db, token) {
   const row = db.prepare(`
     SELECT u.id, u.email, u.name, u.role, s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token = ?`).get(token);
+    WHERE s.token = ? AND u.deactivated_at IS NULL`).get(token);
   if (!row) return null;
   if (row.expires_at < Date.now()) {
     deleteSession(db, token);

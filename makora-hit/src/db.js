@@ -9,7 +9,18 @@ CREATE TABLE IF NOT EXISTS users (
   name          TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
-  created_at    INTEGER NOT NULL
+  created_at    INTEGER NOT NULL,
+  deactivated_at INTEGER
+);
+
+-- Liens de réinitialisation de mot de passe créés par un administrateur (seule l'empreinte est stockée).
+CREATE TABLE IF NOT EXISTS password_resets (
+  token_hash TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -150,6 +161,9 @@ function migrate(db) {
     db.exec('ALTER TABLE messages ADD COLUMN parent_id INTEGER REFERENCES messages(id) ON DELETE CASCADE');
   }
   db.exec('CREATE INDEX IF NOT EXISTS messages_parent ON messages(parent_id)');
+
+  const userColumns = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+  if (!userColumns.includes('deactivated_at')) db.exec('ALTER TABLE users ADD COLUMN deactivated_at INTEGER');
 
   const channelColumns = db.prepare('PRAGMA table_info(channels)').all().map((c) => c.name);
   if (!channelColumns.includes('is_private')) {

@@ -35,6 +35,8 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 
 **Commun**
 - Comptes avec invitations : le premier inscrit devient administrateur, les suivants rejoignent via un lien d'invitation (usage unique, valable 7 jours)
+- **Mon compte** : changer son nom et son mot de passe (les autres appareils sont alors déconnectés)
+- **Administration** : nommer ou retirer des administrateurs, désactiver / réactiver un compte (déconnexion immédiate partout, messages conservés), lien de réinitialisation de mot de passe (usage unique, 24 h), invitations en attente (afficher, révoquer)
 - Recherche dans les messages et les pages (les messages privés ne sont visibles que de leurs participants)
 - Interface en français, mode sombre automatique, utilisable sur mobile
 - **Application installable** (PWA) sur Android, iPhone, Windows et macOS : icône sur l'écran d'accueil, plein écran, démarrage même hors ligne
@@ -74,6 +76,34 @@ En production, placez l'application derrière un reverse proxy HTTPS (Caddy, Ngi
 
 ⚠️ Changer les clés VAPID (ou perdre la base) désabonne tous les appareils : chacun devra réactiver les notifications.
 
+## Mise en ligne sur un serveur
+
+Le plus simple : un petit serveur Linux (VPS à quelques euros par mois chez OVHcloud, Scaleway, Hetzner…) avec Docker, et un nom de domaine (ou sous-domaine) qui pointe vers lui.
+
+1. **DNS** : créez un enregistrement `A` (ex. `chat.mon-entreprise.fr`) vers l'adresse IP du serveur.
+2. **Sur le serveur** (ports 80 et 443 ouverts) :
+   ```bash
+   git clone <ce dépôt> && cd makora-hit
+   DOMAIN=chat.mon-entreprise.fr docker compose up -d
+   ```
+3. Ouvrez `https://chat.mon-entreprise.fr` et créez le compte administrateur **tout de suite** (le premier inscrit devient admin).
+
+Caddy obtient et renouvelle automatiquement le certificat HTTPS. Les données (base + pièces jointes) sont dans le volume Docker `makora-data`.
+
+**Mettre à jour** : `git pull && DOMAIN=chat.mon-entreprise.fr docker compose up -d --build` (la base est migrée automatiquement).
+
+**Sauvegarder** (à planifier chaque nuit, par exemple avec cron) :
+```bash
+# 1. Instantané cohérent de la base dans le volume (les 14 derniers sont conservés)
+docker compose exec app node --disable-warning=ExperimentalWarning src/backup.js
+# 2. Copie hors du serveur : base sauvegardée + pièces jointes
+docker run --rm -v makora-hit_makora-data:/data -v "$PWD":/backup alpine \
+  tar czf /backup/makora-$(date +%F).tar.gz -C /data backups uploads
+```
+Pensez à copier cette archive ailleurs (autre serveur, stockage objet) : une sauvegarde sur la même machine ne protège pas d'une panne de disque.
+
+**Restaurer** : arrêtez l'application, remplacez `/data/makora.db` par une sauvegarde (en supprimant `makora.db-wal` et `makora.db-shm`), remettez le dossier `uploads`, puis relancez.
+
 ## Développement
 
 ```bash
@@ -91,6 +121,7 @@ src/
   push.js      envoi des notifications push (clés VAPID)
   auth.js      mots de passe (scrypt), sessions, cookies
   db.js        schéma SQLite
+  backup.js    sauvegarde cohérente de la base
 public/
   index.html, app.css, app.js   interface (JavaScript sans étape de build)
   markdown.js                   rendu Markdown sécurisé (partagé avec le serveur et les tests)
@@ -113,7 +144,7 @@ test/
 - Pièces jointes dans les pages
 - Notifications par email (résumé des mentions non lues)
 - Préférences de notification par canal (muet, mentions uniquement)
-- Gestion des rôles par l'admin (nommer d'autres administrateurs, désactiver un compte)
 - Renommer / archiver un canal
 - Éditeur de pages par blocs (WYSIWYG)
-- Réinitialisation de mot de passe par email
+- Envoi automatique des invitations et liens de réinitialisation par email (SMTP)
+- Authentification unique (Google Workspace / Microsoft 365)

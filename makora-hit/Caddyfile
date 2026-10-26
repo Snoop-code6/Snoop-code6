@@ -1,0 +1,8 @@
+{$DOMAIN} {
+	encode zstd gzip
+	# Transmet aussi les WebSocket (/ws) ; les pièces jointes peuvent faire jusqu'à 20 Mo.
+	request_body {
+		max_size 25MB
+	}
+	reverse_proxy app:3000
+}
