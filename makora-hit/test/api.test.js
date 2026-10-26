@@ -73,12 +73,12 @@ const carol = client();
 
 describe('comptes', () => {
   test('le premier inscrit devient administrateur sans invitation', async () => {
-    assert.deepEqual((await admin.call('GET', '/setup')).data, { needsSetup: true });
+    assert.deepEqual((await admin.call('GET', '/setup')).data, { needsSetup: true, sso: null, email: false });
     const res = await admin.call('POST', '/auth/register', { email: 'Alice@pme.fr', name: 'Alice Martin', password: 'motdepasse1' });
     assert.equal(res.status, 201);
     assert.equal(res.data.user.role, 'admin');
     assert.equal(res.data.user.email, 'alice@pme.fr');
-    assert.deepEqual((await admin.call('GET', '/setup')).data, { needsSetup: false });
+    assert.equal((await admin.call('GET', '/setup')).data.needsSetup, false);
   });
 
   test('les suivants ont besoin d’une invitation à usage unique', async () => {

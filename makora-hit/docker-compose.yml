@@ -1,5 +1,6 @@
 # Mise en ligne en une commande, HTTPS compris :
 #   DOMAIN=chat.mon-entreprise.fr docker compose up -d
+# Les réglages facultatifs (SMTP_URL, OIDC_…) peuvent être placés dans un fichier .env à côté de ce fichier.
 # Le nom de domaine doit pointer vers ce serveur (ports 80 et 443 ouverts).
 services:
   app:
@@ -7,6 +8,17 @@ services:
     restart: unless-stopped
     environment:
       TRUST_PROXY: "1"
+      PUBLIC_URL: "https://${DOMAIN}"
+      # Facultatif : emails (invitations, mot de passe oublié, résumés). Voir le README.
+      SMTP_URL: "${SMTP_URL:-}"
+      MAIL_FROM: "${MAIL_FROM:-MAKORA HIT <no-reply@${DOMAIN}>}"
+      # Facultatif : connexion avec Google Workspace / Microsoft 365. Voir le README.
+      OIDC_ISSUER: "${OIDC_ISSUER:-}"
+      OIDC_CLIENT_ID: "${OIDC_CLIENT_ID:-}"
+      OIDC_CLIENT_SECRET: "${OIDC_CLIENT_SECRET:-}"
+      OIDC_LABEL: "${OIDC_LABEL:-SSO}"
+      OIDC_ALLOWED_DOMAINS: "${OIDC_ALLOWED_DOMAINS:-}"
+      OIDC_TRUST_EMAIL: "${OIDC_TRUST_EMAIL:-false}"
       # Facultatif : contact transmis aux services de notifications push.
       # VAPID_SUBJECT: "mailto:it@mon-entreprise.fr"
     volumes:

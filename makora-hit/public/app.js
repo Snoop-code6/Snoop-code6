@@ -101,6 +101,7 @@ function dayLabel(ts) {
 const state = {
   me: null,
   limits: { maxUploadBytes: 20 * 1024 * 1024, maxAttachments: 10 },
+  features: { email: false, sso: null },
   users: new Map(),
   online: new Set(),
   channels: new Map(),
@@ -142,9 +143,6 @@ const root = document.getElementById('app');
 
 async function boot() {
   try {
-    const { user, limits } = await api('GET', '/me');
-    state.me = user;
-    state.limits = limits;
     await startApp();
   } catch (err) {
     if (err.status === 401) {
@@ -164,24 +162,36 @@ async function boot() {
 
 // Un lien d'invitation ou de réinitialisation ouvert dans un onglet resté sur l'écran de connexion.
 window.addEventListener('hashchange', () => {
-  if (!state.started && /^#\/(invite|reset)\//.test(location.hash)) showAuth().catch(report);
+  if (!state.started && /^#\/(invite|reset|login-error)\//.test(location.hash)) showAuth().catch(report);
 });
 
-async function showAuth() {
-  const { needsSetup } = await api('GET', '/setup');
+const SSO_ERRORS = {
+  cancelled: 'Connexion annulée.',
+  expired: 'La connexion a expiré ou a été ouverte dans un autre navigateur. Réessayez.',
+  provider: 'Le fournisseur d’identité n’a pas pu confirmer votre connexion. Réessayez, ou contactez votre administrateur.',
+  email: 'Votre fournisseur d’identité n’a pas confirmé votre adresse email.',
+  not_allowed: 'Votre adresse ne fait pas partie des domaines autorisés. Demandez une invitation à votre administrateur.',
+  deactivated: 'Ce compte a été désactivé. Contactez votre administrateur.',
+  setup: 'L’espace n’est pas encore créé : l’administrateur doit d’abord créer son compte avec un mot de passe.',
+};
+
+async function showAuth(forcedMode) {
+  const setup = await api('GET', '/setup');
   const invite = location.hash.match(/^#\/invite\/([a-f0-9]+)$/)?.[1];
   const resetToken = location.hash.match(/^#\/reset\/([a-f0-9]+)$/)?.[1];
-  let mode = 'login';
-  let notice = '';
+  const ssoError = location.hash.match(/^#\/login-error\/(\w+)$/)?.[1];
+  let mode = forcedMode ?? 'login';
+  let notice = ssoError ? SSO_ERRORS[ssoError] ?? SSO_ERRORS.provider : '';
   let resetName = '';
-  if (needsSetup) mode = 'setup';
+  let inviteEmail = null;
+  if (setup.needsSetup) mode = 'setup';
   else if (resetToken) {
     const { valid, name } = await api('GET', `/reset/${resetToken}`);
     if (valid) { mode = 'reset'; resetName = name; }
-    else notice = 'Ce lien de réinitialisation est invalide, déjà utilisé ou expiré. Demandez-en un nouveau à votre administrateur.';
+    else notice = 'Ce lien de réinitialisation est invalide, déjà utilisé ou expiré. Demandez-en un nouveau.';
   } else if (invite) {
-    const { valid } = await api('GET', `/invites/${invite}`);
-    if (valid) mode = 'register';
+    const { valid, email } = await api('GET', `/invites/${invite}`);
+    if (valid) { mode = 'register'; inviteEmail = email; }
     else notice = 'Ce lien d’invitation est invalide ou a expiré. Demandez-en un nouveau à votre administrateur.';
   }
 
@@ -190,28 +200,39 @@ async function showAuth() {
     register: ['Rejoindre l’équipe', 'Vous avez été invité·e. Créez votre compte pour commencer.'],
     login: ['Connexion', 'Retrouvez les discussions et documents de votre équipe.'],
     reset: ['Nouveau mot de passe', `Bonjour ${resetName}, choisissez votre nouveau mot de passe.`],
+    forgot: ['Mot de passe oublié', 'Indiquez votre adresse : vous recevrez un lien pour choisir un nouveau mot de passe.'],
   };
   const [title, subtitle] = titles[mode];
   const error = h('p', { class: 'form-error', role: 'alert' });
   const field = (label, name, type, extra = {}) => h('label', { class: 'field' },
     h('span', {}, label), h('input', { name, type, required: true, ...extra }));
+  const link = (label, onclick) => h('button', { type: 'button', class: 'link', onclick }, label);
+  const ssoButton = setup.sso && (mode === 'login' || mode === 'register') && h('div', { class: 'stack tight' },
+    h('a', { class: 'btn block sso', href: '/api/auth/sso' }, `Se connecter avec ${setup.sso.label}`),
+    h('div', { class: 'or' }, h('span', {}, 'ou')));
 
   const form = h('form', { class: 'auth-card' },
     h('div', { class: 'brand' }, h('img', { src: '/favicon.svg', alt: '' }), 'MAKORA HIT'),
     h('h1', {}, title),
     h('p', { class: 'muted' }, subtitle),
     notice && h('p', { class: 'notice' }, notice),
+    ssoButton,
     (mode === 'setup' || mode === 'register') && field('Nom complet', 'name', 'text', { autocomplete: 'name', maxlength: 80 }),
-    mode !== 'reset' && field('Email professionnel', 'email', 'email', { autocomplete: 'email' }),
-    field(mode === 'reset' ? 'Nouveau mot de passe (8 caractères minimum)' : 'Mot de passe', 'password', 'password', {
+    mode !== 'reset' && field('Email professionnel', 'email', 'email', {
+      autocomplete: 'email', value: inviteEmail ?? undefined, readonly: Boolean(inviteEmail),
+    }),
+    mode !== 'forgot' && field(mode === 'reset' ? 'Nouveau mot de passe (8 caractères minimum)' : 'Mot de passe', 'password', 'password', {
       autocomplete: mode === 'login' ? 'current-password' : 'new-password',
       minlength: mode === 'login' ? undefined : 8,
     }),
     error,
     h('button', { class: 'btn primary block', type: 'submit' },
-      { login: 'Se connecter', reset: 'Enregistrer et me connecter' }[mode] ?? 'Créer mon compte'),
-    mode === 'login' && h('p', { class: 'muted small' }, 'Pas de compte ? Demandez un lien d’invitation à votre administrateur.'),
-    mode === 'login' && h('p', { class: 'muted small' }, 'Mot de passe oublié ? Votre administrateur peut vous envoyer un lien de réinitialisation.'),
+      { login: 'Se connecter', reset: 'Enregistrer et me connecter', forgot: 'Recevoir le lien' }[mode] ?? 'Créer mon compte'),
+    mode === 'login' && (setup.email
+      ? h('p', { class: 'small' }, link('Mot de passe oublié ?', () => showAuth('forgot')))
+      : h('p', { class: 'muted small' }, 'Mot de passe oublié ? Votre administrateur peut vous envoyer un lien de réinitialisation.')),
+    mode === 'login' && h('p', { class: 'muted small' }, 'Pas de compte ? Demandez une invitation à votre administrateur.'),
+    mode === 'forgot' && h('p', { class: 'small' }, link('← Retour à la connexion', () => showAuth('login'))),
   );
 
   form.addEventListener('submit', async (e) => {
@@ -221,9 +242,15 @@ async function showAuth() {
     button.disabled = true;
     error.textContent = '';
     try {
+      if (mode === 'forgot') {
+        await api('POST', '/auth/forgot', { email: data.email });
+        form.replaceChildren(form.firstChild, h('h1', {}, 'Vérifiez vos emails'),
+          h('p', {}, 'Si un compte existe pour ', h('strong', {}, data.email), ', un lien pour choisir un nouveau mot de passe vient d’être envoyé. Il est valable 24 heures.'),
+          h('p', { class: 'small' }, link('← Retour à la connexion', () => showAuth('login'))));
+        return;
+      }
       const path = { login: '/auth/login', reset: '/auth/reset' }[mode] ?? '/auth/register';
-      const { user } = await api('POST', path, { ...data, invite, token: resetToken });
-      state.me = user;
+      await api('POST', path, { ...data, invite, token: resetToken });
       history.replaceState(null, '', location.pathname);
       await startApp();
     } catch (err) {
@@ -232,15 +259,19 @@ async function showAuth() {
     }
   });
 
+  if (ssoError) history.replaceState(null, '', location.pathname);
   root.replaceChildren(h('div', { class: 'auth' }, form));
-  form.querySelector('input')?.focus();
+  form.querySelector('input:not([readonly])')?.focus();
 }
 
 async function startApp() {
   if (state.started) return;
+  // La session d'abord : sans elle, inutile de lancer les autres requêtes.
+  const me = await api('GET', '/me');
   const [{ users, online }, { channels }, { pages }, activity] = await Promise.all([
     api('GET', '/users'), api('GET', '/channels'), api('GET', '/pages'), api('GET', '/notifications'),
   ]);
+  Object.assign(state, { me: me.user, limits: me.limits, features: me.features });
   state.users = new Map(users.map((u) => [u.id, u]));
   state.online = new Set(online);
   state.channels = new Map(channels.map((c) => [c.id, c]));
@@ -1209,13 +1240,40 @@ async function openDm(userId) {
   } catch (err) { report(err); }
 }
 
-async function createInvite() {
-  try {
-    const { token, expiresAt } = await api('POST', '/invites');
-    showLink('Inviter un collègue', 'Envoyez ce lien à la personne à inviter. Il ne peut servir qu’une fois et expire le ',
-      `${location.origin}/#/invite/${token}`, expiresAt);
-    if (state.view?.kind === 'admin') loadAdmin(state.view);
-  } catch (err) { report(err); }
+// Invitation : avec une adresse, le lien est réservé à cette personne (et lui est envoyé si les emails sont configurés).
+function createInvite() {
+  const error = h('p', { class: 'form-error', role: 'alert' });
+  const form = h('form', { class: 'stack' },
+    h('label', { class: 'field' },
+      h('span', {}, state.features.email ? 'Adresse email de la personne' : 'Adresse email (facultatif)'),
+      h('input', { name: 'email', type: 'email', required: state.features.email, placeholder: 'prenom.nom@entreprise.fr', autocomplete: 'off' })),
+    h('p', { class: 'muted small' }, state.features.email
+      ? 'Elle recevra un email avec un lien pour créer son compte (usage unique, valable 7 jours).'
+      : 'Le lien sera réservé à cette adresse. Laissez vide pour un lien utilisable par n’importe qui (une seule fois).'),
+    error,
+    h('div', { class: 'row wrap' },
+      h('button', { class: 'btn primary', type: 'submit' }, state.features.email ? 'Envoyer l’invitation' : 'Créer le lien'),
+      state.features.email && h('button', { class: 'btn', type: 'button', onclick: () => submit(true) }, 'Juste créer un lien')));
+  const dlg = dialog('Inviter un collègue', form);
+
+  async function submit(linkOnly = false) {
+    error.textContent = '';
+    const email = new FormData(form).get('email').trim();
+    try {
+      const res = await api('POST', '/invites', { email: email || undefined, send: !linkOnly });
+      dlg.close();
+      if (res.emailed) {
+        toast(`Invitation envoyée à ${res.email}.`, 'info');
+      } else {
+        showLink('Lien d’invitation', `${res.email ? `Réservé à ${res.email}. ` : ''}Envoyez ce lien à la personne à inviter. Il ne peut servir qu’une fois et expire le `,
+          `${location.origin}/#/invite/${res.token}`, res.expiresAt);
+        if (res.email && state.features.email) toast('L’email n’a pas pu être envoyé : transmettez le lien vous-même.');
+      }
+      if (state.view?.kind === 'admin') loadAdmin(state.view);
+    } catch (err) { error.textContent = err.message; }
+  }
+  form.addEventListener('submit', (e) => { e.preventDefault(); submit(); });
+  form.querySelector('input').focus();
 }
 
 function showLink(title, intro, link, expiresAt) {
@@ -2108,7 +2166,24 @@ function openAccountDialog() {
       h('button', { class: 'btn primary', onclick: () => { dlg.close(); location.hash = '#/admin'; } }, '🛠 Administration'),
       h('button', { class: 'btn', onclick: () => { dlg.close(); createInvite(); } }, 'Inviter un collègue')),
     h('h3', {}, 'Profil'), nameForm,
-    h('h3', {}, 'Mot de passe'), pwForm,
+    h('h3', {}, 'Mot de passe'),
+    me.hasPassword === false
+      ? h('p', { class: 'muted small' }, `Vous vous connectez avec ${state.features.sso ?? 'votre compte d’entreprise'} : pas de mot de passe à gérer ici.`)
+      : pwForm,
+    state.features.email && h('h3', {}, 'Notifications par email'),
+    state.features.email && h('label', { class: 'check' },
+      h('input', {
+        type: 'checkbox', checked: me.emailNotifications !== false,
+        onchange: async (e) => {
+          try {
+            const { user } = await api('PATCH', '/me', { emailNotifications: e.target.checked });
+            state.me.emailNotifications = user.emailNotifications;
+            toast(user.emailNotifications ? 'Résumés par email activés.' : 'Résumés par email désactivés.', 'info');
+          } catch (err) { e.target.checked = !e.target.checked; report(err); }
+        },
+      }),
+      h('span', {}, 'Recevoir un email quand des mentions ou réponses restent non lues plus de 15 minutes',
+        h('span', { class: 'muted small block' }, 'Au plus un email par heure, jamais quand l’application est ouverte.'))),
     h('hr'),
     h('button', { class: 'btn danger block', onclick: logout }, 'Se déconnecter'));
 }
@@ -2166,9 +2241,9 @@ function renderAdmin(v) {
         class: 'btn small',
         onclick: async () => {
           try {
-            const { token, expiresAt } = await api('POST', `/admin/users/${u.id}/reset`);
+            const { token, expiresAt, emailed } = await api('POST', `/admin/users/${u.id}/reset`, { send: state.features.email });
             showLink(`Réinitialiser le mot de passe de ${u.name}`,
-              `Envoyez ce lien à ${u.name} : il·elle pourra choisir un nouveau mot de passe, et ses sessions ouvertes seront fermées. Lien à usage unique, valable jusqu’au `,
+              `${emailed ? `Un email avec ce lien vient d’être envoyé à ${u.email}. ` : `Envoyez ce lien à ${u.name} : `}il·elle pourra choisir un nouveau mot de passe, et ses sessions ouvertes seront fermées. Lien à usage unique, valable jusqu’au `,
               `${location.origin}/#/reset/${token}`, expiresAt);
           } catch (err) { report(err); }
         },
@@ -2199,7 +2274,7 @@ function renderAdmin(v) {
       h('h2', {}, 'Invitations en attente'),
       v.invites.length
         ? h('ul', { class: 'admin-list' }, v.invites.map((i) => h('li', { class: 'admin-user' },
-          h('div', {}, h('strong', {}, `Invitation de ${userName(i.createdBy)}`),
+          h('div', {}, h('strong', {}, i.email ? `${i.email}` : `Lien ouvert à tous`, h('span', { class: 'muted' }, ` · invitation de ${userName(i.createdBy)}`)),
             h('div', { class: 'muted small' }, `créée le ${dateTimeFmt.format(i.createdAt)} · expire le ${dateTimeFmt.format(i.expiresAt)}`)),
           h('div', { class: 'admin-actions' },
             h('button', {

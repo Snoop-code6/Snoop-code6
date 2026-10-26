@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
   created_at    INTEGER NOT NULL,
-  deactivated_at INTEGER
+  deactivated_at INTEGER,
+  email_notifications INTEGER NOT NULL DEFAULT 1,
+  last_digest_at INTEGER
 );
 
 -- Liens de réinitialisation de mot de passe créés par un administrateur (seule l'empreinte est stockée).
@@ -139,6 +141,14 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (
   created_at INTEGER NOT NULL
 );
 
+-- Connexions SSO en cours (le temps de l'aller-retour chez le fournisseur d'identité).
+CREATE TABLE IF NOT EXISTS sso_attempts (
+  state      TEXT PRIMARY KEY,
+  nonce      TEXT NOT NULL,
+  verifier   TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -154,6 +164,11 @@ export function openDb(file = ':memory:') {
   return db;
 }
 
+function addColumn(db, table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
 // Met à niveau les bases créées par une version précédente.
 function migrate(db) {
   const columns = db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name);
@@ -162,8 +177,11 @@ function migrate(db) {
   }
   db.exec('CREATE INDEX IF NOT EXISTS messages_parent ON messages(parent_id)');
 
-  const userColumns = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
-  if (!userColumns.includes('deactivated_at')) db.exec('ALTER TABLE users ADD COLUMN deactivated_at INTEGER');
+  addColumn(db, 'users', 'deactivated_at', 'INTEGER');
+  addColumn(db, 'users', 'email_notifications', 'INTEGER NOT NULL DEFAULT 1');
+  addColumn(db, 'users', 'last_digest_at', 'INTEGER');
+  addColumn(db, 'invites', 'email', 'TEXT');
+  addColumn(db, 'notifications', 'emailed_at', 'INTEGER');
 
   const channelColumns = db.prepare('PRAGMA table_info(channels)').all().map((c) => c.name);
   if (!channelColumns.includes('is_private')) {

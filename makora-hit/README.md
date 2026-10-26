@@ -35,7 +35,9 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 
 **Commun**
 - Comptes avec invitations : le premier inscrit devient administrateur, les suivants rejoignent via un lien d'invitation (usage unique, valable 7 jours)
-- **Mon compte** : changer son nom et son mot de passe (les autres appareils sont alors déconnectés)
+- **Connexion avec Google Workspace ou Microsoft 365** (optionnelle) : les collègues de vos domaines obtiennent un compte automatiquement à leur première connexion
+- **Emails** (optionnels) : invitations envoyées par email (lien réservé à l'adresse invitée), « mot de passe oublié » en libre-service, liens de réinitialisation envoyés par l'admin, **résumé par email** des mentions et réponses restées non lues plus de 15 minutes (au plus un par heure, désactivable)
+- **Mon compte** : changer son nom et son mot de passe (les autres appareils sont alors déconnectés), préférences d'email
 - **Administration** : nommer ou retirer des administrateurs, désactiver / réactiver un compte (déconnexion immédiate partout, messages conservés), lien de réinitialisation de mot de passe (usage unique, 24 h), invitations en attente (afficher, révoquer)
 - Recherche dans les messages et les pages (les messages privés ne sont visibles que de leurs participants)
 - Interface en français, mode sombre automatique, utilisable sur mobile
@@ -61,6 +63,14 @@ Ouvrez http://localhost:3000, créez le compte administrateur, puis invitez vos 
 | `UPLOAD_DIR`  | `data/uploads`      | Dossier des pièces jointes (à sauvegarder avec la base)     |
 | `MAX_UPLOAD_MB` | `20`              | Taille maximale d'une pièce jointe, en Mo                   |
 | `TRUST_PROXY` | non défini          | À définir (ex. `1`) derrière un reverse proxy HTTPS         |
+| `PUBLIC_URL` | non défini | Adresse publique (ex. `https://chat.mon-entreprise.fr`) ; **obligatoire** pour les emails et le SSO |
+| `SMTP_URL` | non défini | Serveur d'envoi d'emails, ex. `smtps://utilisateur:motdepasse@smtp.fournisseur.fr:465` |
+| `MAIL_FROM` | `MAKORA HIT <no-reply@localhost>` | Expéditeur des emails |
+| `EMAIL_DIGEST_DELAY_MIN` | `15` | Délai avant d'envoyer par email une notification non lue |
+| `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` | non définis | Connexion SSO (voir ci-dessous) |
+| `OIDC_LABEL` | `SSO` | Texte du bouton : « Se connecter avec … » |
+| `OIDC_ALLOWED_DOMAINS` | aucun | Domaines dont les personnes obtiennent un compte automatiquement (ex. `mon-entreprise.fr,filiale.fr`) ; sinon il faut une invitation |
+| `OIDC_TRUST_EMAIL` | `false` | À mettre à `true` pour Microsoft 365 avec un locataire précis (voir ci-dessous) |
 | `VAPID_SUBJECT` | `mailto:` + email du 1er admin | Contact transmis aux services push (Google, Apple, Mozilla) |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | générées au 1er démarrage | Clés des notifications push ; par défaut créées une fois et conservées en base |
 
@@ -75,6 +85,24 @@ En production, placez l'application derrière un reverse proxy HTTPS (Caddy, Ngi
 - Puis, dans l'onglet **Activité** : « Activer les notifications sur cet appareil ». À la déconnexion, l'appareil cesse de recevoir les notifications du compte.
 
 ⚠️ Changer les clés VAPID (ou perdre la base) désabonne tous les appareils : chacun devra réactiver les notifications.
+
+### Emails
+
+N'importe quel service SMTP convient : celui de votre messagerie (Microsoft 365, Google Workspace, OVH…) ou un service d'envoi (Brevo, Mailjet, Amazon SES…). Renseignez `SMTP_URL`, `MAIL_FROM` et `PUBLIC_URL`. Les liens contenus dans les emails sont toujours construits à partir de `PUBLIC_URL`, jamais à partir de la requête reçue.
+
+Sans SMTP, tout fonctionne quand même : les liens d'invitation et de réinitialisation s'affichent à l'écran pour être transmis à la main.
+
+### Connexion avec Google Workspace ou Microsoft 365
+
+L'adresse de retour à déclarer chez le fournisseur est `PUBLIC_URL` + `/api/auth/sso/callback`.
+
+- **Google Workspace** : console Google Cloud → API et services → Identifiants → « ID client OAuth » (application Web), avec l'adresse de retour ci-dessus. Puis :
+  `OIDC_ISSUER=https://accounts.google.com`, `OIDC_CLIENT_ID=…`, `OIDC_CLIENT_SECRET=…`, `OIDC_LABEL=Google`, `OIDC_ALLOWED_DOMAINS=mon-entreprise.fr`.
+- **Microsoft 365 / Entra ID** : portail Azure → Entra ID → Inscriptions d'applications → Nouvelle inscription (plateforme Web, adresse de retour ci-dessus), puis créez un secret client. Utilisez l'émetteur **de votre locataire** :
+  `OIDC_ISSUER=https://login.microsoftonline.com/<ID du locataire>/v2.0`, `OIDC_LABEL=Microsoft`, `OIDC_ALLOWED_DOMAINS=mon-entreprise.fr`, `OIDC_TRUST_EMAIL=true`.
+  (Microsoft n'indique pas si l'adresse est vérifiée ; avec l'émetteur de votre propre locataire, ce sont vos administrateurs qui gèrent les adresses, d'où `OIDC_TRUST_EMAIL`. Ne l'activez jamais avec l'émetteur `common`.)
+
+Le compte administrateur initial se crée toujours avec un mot de passe. Une personne déjà inscrite peut ensuite se connecter par SSO avec la même adresse ; un compte désactivé reste refusé.
 
 ## Mise en ligne sur un serveur
 
@@ -119,6 +147,8 @@ src/
   app.js       routes de l'API REST (/api/...)
   realtime.js  diffusion des événements en temps réel
   push.js      envoi des notifications push (clés VAPID)
+  mailer.js, emails.js   envoi des emails et leurs modèles
+  oidc.js      connexion SSO (OpenID Connect, PKCE, vérification des jetons)
   auth.js      mots de passe (scrypt), sessions, cookies
   db.js        schéma SQLite
   backup.js    sauvegarde cohérente de la base
@@ -142,9 +172,6 @@ test/
 ## Pistes pour la suite
 
 - Pièces jointes dans les pages
-- Notifications par email (résumé des mentions non lues)
 - Préférences de notification par canal (muet, mentions uniquement)
 - Renommer / archiver un canal
 - Éditeur de pages par blocs (WYSIWYG)
-- Envoi automatique des invitations et liens de réinitialisation par email (SMTP)
-- Authentification unique (Google Workspace / Microsoft 365)

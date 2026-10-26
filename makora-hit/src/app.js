@@ -7,11 +7,17 @@ import {
   parseCookies, SESSION_COOKIE, sessionCookie, userFromToken, verifyPassword,
 } from './auth.js';
 import { transaction } from './db.js';
+import { digestEmail, inviteEmail, resetEmail } from './emails.js';
 import { mentionRegex } from '../public/markdown.js';
 
 const PUBLIC_DIR = fileURLToPath(new URL('../public', import.meta.url));
 const INVITE_TTL_MS = 7 * 24 * 3600 * 1000;
 const RESET_TTL_MS = 24 * 3600 * 1000;
+const SSO_ATTEMPT_TTL_MS = 10 * 60 * 1000;
+const SSO_COOKIE = 'makora_sso';
+const DIGEST_DELAY_MS = Number(process.env.EMAIL_DIGEST_DELAY_MIN ?? 15) * 60 * 1000;
+const DIGEST_MIN_INTERVAL_MS = 3600 * 1000;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PAGE_SIZE = 50;
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_MB ?? 20) * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -83,7 +89,12 @@ function loginLimiter({ max = 10, windowMs = 15 * 60 * 1000 } = {}) {
 }
 
 // push : { publicKey, send(subscription, payload) } ; absent, les notifications push sont désactivées.
-export function createApp({ db, hub, uploadDir: dir, push = null }) {
+// mailer : { send({ to, subject, text, html }) } ; les emails demandent aussi publicUrl (adresse publique
+// de l'application), car les liens qu'ils contiennent ne doivent jamais dépendre de la requête reçue.
+// oidc : connexion via Google Workspace / Microsoft 365 (voir oidc.js).
+export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null, publicUrl = null, oidc = null }) {
+  const mail = mailer && publicUrl ? mailer : null;
+  const appUrl = publicUrl?.replace(/\/$/, '');
   const uploadDir = resolve(dir);
   mkdirSync(uploadDir, { recursive: true });
   const app = express();
@@ -138,13 +149,29 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
     reset: db.prepare(`SELECT r.*, u.name, u.deactivated_at FROM password_resets r JOIN users u ON u.id = r.user_id
       WHERE r.token_hash = ?`),
     useReset: db.prepare('UPDATE password_resets SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'),
-    pendingInvites: db.prepare(`SELECT token, created_by, created_at, expires_at FROM invites
+    pendingInvites: db.prepare(`SELECT token, created_by, created_at, expires_at, email FROM invites
       WHERE used_by IS NULL AND expires_at > ? ORDER BY created_at DESC`),
     deleteInvite: db.prepare('DELETE FROM invites WHERE token = ? AND used_by IS NULL'),
     userName: db.prepare('SELECT name FROM users WHERE id = ?'),
     userById: db.prepare('SELECT id FROM users WHERE id = ? AND deactivated_at IS NULL'),
     invite: db.prepare('SELECT * FROM invites WHERE token = ?'),
-    insertInvite: db.prepare('INSERT INTO invites (token, created_by, created_at, expires_at) VALUES (?, ?, ?, ?)'),
+    insertInvite: db.prepare('INSERT INTO invites (token, created_by, created_at, expires_at, email) VALUES (?, ?, ?, ?, ?)'),
+    lastResetFor: db.prepare('SELECT MAX(created_at) AS at FROM password_resets WHERE user_id = ?'),
+    insertSsoAttempt: db.prepare('INSERT INTO sso_attempts (state, nonce, verifier, created_at) VALUES (?, ?, ?, ?)'),
+    takeSsoAttempt: db.prepare('DELETE FROM sso_attempts WHERE state = ? RETURNING *'),
+    purgeSsoAttempts: db.prepare('DELETE FROM sso_attempts WHERE created_at < ?'),
+    setEmailNotifications: db.prepare('UPDATE users SET email_notifications = ? WHERE id = ?'),
+    digestCandidates: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id,
+        (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count
+      FROM notifications n
+      JOIN messages m ON m.id = n.message_id
+      JOIN users u ON u.id = n.user_id
+      WHERE n.read_at IS NULL AND n.emailed_at IS NULL AND n.created_at <= ?
+        AND u.deactivated_at IS NULL AND u.email_notifications = 1
+        AND (u.last_digest_at IS NULL OR u.last_digest_at <= ?)
+      ORDER BY n.user_id, n.id`),
+    markEmailed: db.prepare('UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))'),
+    setLastDigest: db.prepare('UPDATE users SET last_digest_at = ? WHERE id = ?'),
     useInvite: db.prepare('UPDATE invites SET used_by = ? WHERE token = ? AND used_by IS NULL'),
     channel: db.prepare('SELECT * FROM channels WHERE id = ?'),
     channelByName: db.prepare('SELECT * FROM channels WHERE name = ?'),
@@ -422,18 +449,43 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
 
   function login(req, res, userId) {
     const { token, expiresAt } = createSession(db, userId);
-    res.set('Set-Cookie', sessionCookie(token, expiresAt, req.secure));
+    res.append('Set-Cookie', sessionCookie(token, expiresAt, req.secure));
   }
 
   // --- Comptes ---------------------------------------------------------------
 
   api.get('/setup', (req, res) => {
-    res.json({ needsSetup: q.userCount.get().n === 0 });
+    res.json({ needsSetup: q.userCount.get().n === 0, sso: oidc ? { label: oidc.label } : null, email: Boolean(mail) });
   });
+
+  // Envoi « au mieux » : un email qui échoue ne doit pas faire échouer l'action demandée.
+  async function sendMail(to, content) {
+    try {
+      await mail.send({ to, ...content });
+      return true;
+    } catch (err) {
+      console.warn(`Échec de l’envoi d’email à ${to} :`, err.message);
+      return false;
+    }
+  }
+
+  function createAccount({ email, name, passwordHash, role }) {
+    const now = Date.now();
+    const id = Number(q.insertUser.run(email, name, passwordHash, role, now).lastInsertRowid);
+    let general = q.channelByName.get('general');
+    if (!general) {
+      const cid = q.insertChannel.run('general', 'Annonces et discussions de toute l’équipe', 0, id, now, 0).lastInsertRowid;
+      general = q.channel.get(cid);
+      q.insertPage.run(null, 'Bienvenue sur MAKORA HIT', WELCOME_PAGE, id, id, now, now);
+    }
+    q.join.run(general.id, id, general.id);
+    return id;
+  }
 
   api.get('/invites/:token', (req, res) => {
     const invite = q.invite.get(req.params.token);
-    res.json({ valid: Boolean(invite && !invite.used_by && invite.expires_at > Date.now()) });
+    const valid = Boolean(invite && !invite.used_by && invite.expires_at > Date.now());
+    res.json({ valid, email: valid ? invite.email ?? null : null });
   });
 
   api.post('/auth/register', (req, res) => {
@@ -451,20 +503,13 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
         invite = q.invite.get(String(req.body?.invite ?? ''));
         if (!invite || invite.used_by || invite.expires_at < Date.now()) fail(403, 'Invitation invalide ou expirée.');
       }
+      // Une invitation envoyée à une adresse précise ne sert qu'à cette adresse.
+      if (invite?.email && invite.email !== email) fail(403, `Cette invitation est réservée à ${invite.email}.`);
       if (q.userByEmail.get(email)) fail(409, 'Un compte existe déjà avec cet email.');
 
-      const now = Date.now();
       const role = first ? 'admin' : 'member';
-      const id = Number(q.insertUser.run(email, name, hashPassword(password), role, now).lastInsertRowid);
+      const id = createAccount({ email, name, passwordHash: hashPassword(password), role });
       if (invite) q.useInvite.run(id, invite.token);
-
-      let general = q.channelByName.get('general');
-      if (!general) {
-        const cid = q.insertChannel.run('general', 'Annonces et discussions de toute l’équipe', 0, id, now, 0).lastInsertRowid;
-        general = q.channel.get(cid);
-        q.insertPage.run(null, 'Bienvenue sur MAKORA HIT', WELCOME_PAGE, id, id, now, now);
-      }
-      q.join.run(general.id, id, general.id);
       return { id, email, name, role };
     });
 
@@ -503,6 +548,79 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
     return reset;
   }
 
+  function createResetLink(userId, createdBy) {
+    const token = newToken();
+    const now = Date.now();
+    q.insertReset.run(hashToken(token), userId, createdBy, now, now + RESET_TTL_MS);
+    return { token, expiresAt: now + RESET_TTL_MS };
+  }
+
+  // Réponse identique que le compte existe ou non, pour ne pas révéler qui a un compte.
+  api.post('/auth/forgot', (req, res) => {
+    if (!mail) fail(404, 'La réinitialisation par email n’est pas configurée sur ce serveur.');
+    const key = `forgot:${req.ip}`;
+    limiter.check(key);
+    limiter.failed(key); // chaque demande compte, réussie ou non
+    const email = String(req.body?.email ?? '').trim().toLowerCase();
+    const user = q.userByEmail.get(email);
+    const recent = user && (q.lastResetFor.get(user.id).at ?? 0) > Date.now() - 2 * 60 * 1000;
+    if (user && !user.deactivated_at && !recent) {
+      const { token, expiresAt } = createResetLink(user.id, null);
+      sendMail(user.email, resetEmail({ name: user.name, link: `${appUrl}/#/reset/${token}`, expiresAt, requested: true }));
+    }
+    res.status(204).end();
+  });
+
+  // --- Connexion via Google Workspace / Microsoft 365 -------------------------
+
+  const ssoFail = (res, code) => res.redirect(303, `/#/login-error/${code}`);
+
+  api.get('/auth/sso', async (req, res) => {
+    if (!oidc) return res.status(404).json({ error: 'Connexion SSO non configurée.' });
+    try {
+      q.purgeSsoAttempts.run(Date.now() - SSO_ATTEMPT_TTL_MS);
+      const attempt = oidc.newAttempt();
+      q.insertSsoAttempt.run(attempt.state, attempt.nonce, attempt.verifier, Date.now());
+      // Le cookie lie la tentative à ce navigateur (empêche de faire connecter quelqu'un à son insu).
+      res.set('Set-Cookie', `${SSO_COOKIE}=${attempt.state}; Path=/api/auth/sso; HttpOnly; SameSite=Lax; Max-Age=600${req.secure ? '; Secure' : ''}`);
+      res.redirect(303, await oidc.authorizationUrl(attempt));
+    } catch (err) {
+      console.warn('SSO indisponible :', err.message);
+      ssoFail(res, 'provider');
+    }
+  });
+
+  api.get('/auth/sso/callback', async (req, res) => {
+    if (!oidc) return res.status(404).json({ error: 'Connexion SSO non configurée.' });
+    res.append('Set-Cookie', `${SSO_COOKIE}=; Path=/api/auth/sso; HttpOnly; SameSite=Lax; Max-Age=0`);
+    if (req.query.error) return ssoFail(res, 'cancelled');
+    const state = String(req.query.state ?? '');
+    const attempt = state && parseCookies(req.headers.cookie)[SSO_COOKIE] === state ? q.takeSsoAttempt.get(state) : null;
+    if (!attempt || attempt.created_at < Date.now() - SSO_ATTEMPT_TTL_MS) return ssoFail(res, 'expired');
+
+    let identity;
+    try {
+      identity = await oidc.complete({ code: String(req.query.code ?? ''), verifier: attempt.verifier, nonce: attempt.nonce });
+    } catch (err) {
+      console.warn('Échec de la connexion SSO :', err.message);
+      return ssoFail(res, err.code === 'email' ? 'email' : 'provider');
+    }
+
+    let user = q.userByEmail.get(identity.email);
+    if (user?.deactivated_at) return ssoFail(res, 'deactivated');
+    if (!user) {
+      // Le premier compte (administrateur) se crée avec un mot de passe.
+      if (q.userCount.get().n === 0) return ssoFail(res, 'setup');
+      if (!identity.domainAllowed) return ssoFail(res, 'not_allowed');
+      // Pas de mot de passe : « sso$ » n'est pas un format reconnu, la connexion par mot de passe est impossible.
+      const id = transaction(db, () => createAccount({ email: identity.email, name: identity.name, passwordHash: 'sso$', role: 'member' }));
+      user = q.fullUser.get(id);
+      hub.broadcast({ type: 'user:new', user: toUser(user) });
+    }
+    login(req, res, user.id);
+    res.redirect(303, '/#/');
+  });
+
   api.get('/reset/:token', (req, res) => {
     const reset = usableReset(req.params.token);
     res.json({ valid: Boolean(reset), name: reset?.name ?? null });
@@ -531,21 +649,36 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
 
   api.use(requireUser);
 
-  api.get('/me', (req, res) => res.json({ user: req.user, limits: { maxUploadBytes: MAX_UPLOAD_BYTES, maxAttachments: MAX_ATTACHMENTS } }));
+  api.get('/me', (req, res) => {
+    const full = q.fullUser.get(req.user.id);
+    res.json({
+      user: { ...req.user, hasPassword: full.password_hash.startsWith('scrypt$'), emailNotifications: Boolean(full.email_notifications) },
+      limits: { maxUploadBytes: MAX_UPLOAD_BYTES, maxAttachments: MAX_ATTACHMENTS },
+      features: { email: Boolean(mail), sso: oidc ? oidc.label : null },
+    });
+  });
 
   // --- Mon compte ----------------------------------------------------------
 
   const broadcastUser = (id) => hub.broadcast({ type: 'user:updated', user: toUser(q.fullUser.get(id)) });
 
   api.patch('/me', (req, res) => {
-    const name = text(req.body?.name, 'nom', { min: 1, max: 80 });
-    q.setName.run(name, req.user.id);
-    broadcastUser(req.user.id);
-    res.json({ user: toUser(q.fullUser.get(req.user.id)) });
+    const b = req.body ?? {};
+    if (b.emailNotifications !== undefined) {
+      if (typeof b.emailNotifications !== 'boolean') fail(400, 'Préférence invalide.');
+      q.setEmailNotifications.run(b.emailNotifications ? 1 : 0, req.user.id);
+    }
+    if (b.name !== undefined) {
+      q.setName.run(text(b.name, 'nom', { min: 1, max: 80 }), req.user.id);
+      broadcastUser(req.user.id);
+    }
+    const full = q.fullUser.get(req.user.id);
+    res.json({ user: { ...toUser(full), emailNotifications: Boolean(full.email_notifications) } });
   });
 
   api.post('/me/password', (req, res) => {
     const user = q.fullUser.get(req.user.id);
+    if (!user.password_hash.startsWith('scrypt$')) fail(400, 'Ce compte se connecte via SSO et n’a pas de mot de passe.');
     if (!verifyPassword(String(req.body?.current ?? ''), user.password_hash)) fail(400, 'Mot de passe actuel incorrect.');
     const password = validPassword(req.body?.password);
     q.setPassword.run(hashPassword(password), user.id);
@@ -587,20 +720,21 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
     res.json({ user: toUser(q.fullUser.get(user.id)) });
   });
 
-  api.post('/admin/users/:id/reset', requireAdmin, (req, res) => {
+  api.post('/admin/users/:id/reset', requireAdmin, async (req, res) => {
     const user = q.fullUser.get(intParam(req.params.id));
     if (!user) fail(404, 'Utilisateur introuvable.');
     if (user.deactivated_at) fail(400, 'Réactivez d’abord ce compte.');
-    const token = newToken();
-    const now = Date.now();
-    q.insertReset.run(hashToken(token), user.id, req.user.id, now, now + RESET_TTL_MS);
-    res.status(201).json({ token, expiresAt: now + RESET_TTL_MS });
+    const { token, expiresAt } = createResetLink(user.id, req.user.id);
+    const emailed = req.body?.send === true && mail
+      ? await sendMail(user.email, resetEmail({ name: user.name, link: `${appUrl}/#/reset/${token}`, expiresAt, requested: false }))
+      : false;
+    res.status(201).json({ token, expiresAt, emailed });
   });
 
   api.get('/admin/invites', requireAdmin, (req, res) => {
     res.json({
       invites: q.pendingInvites.all(Date.now()).map((i) => ({
-        token: i.token, createdBy: i.created_by, createdAt: i.created_at, expiresAt: i.expires_at,
+        token: i.token, createdBy: i.created_by, createdAt: i.created_at, expiresAt: i.expires_at, email: i.email,
       })),
     });
   });
@@ -614,12 +748,50 @@ export function createApp({ db, hub, uploadDir: dir, push = null }) {
     res.json({ users: q.users.all().map(toUser), online: hub.online() });
   });
 
-  api.post('/invites', requireAdmin, (req, res) => {
+  api.post('/invites', requireAdmin, async (req, res) => {
+    let email = null;
+    if (req.body?.email) {
+      email = text(req.body.email, 'email', { min: 3, max: 200 }).toLowerCase();
+      if (!EMAIL_RE.test(email)) fail(400, 'Adresse email invalide.');
+      if (q.userByEmail.get(email)) fail(409, 'Cette personne a déjà un compte.');
+    }
     const token = newToken();
     const now = Date.now();
-    q.insertInvite.run(token, req.user.id, now, now + INVITE_TTL_MS);
-    res.status(201).json({ token, expiresAt: now + INVITE_TTL_MS });
+    const expiresAt = now + INVITE_TTL_MS;
+    q.insertInvite.run(token, req.user.id, now, expiresAt, email);
+    const emailed = email && mail && req.body?.send !== false
+      ? await sendMail(email, inviteEmail({ inviter: req.user.name, link: `${appUrl}/#/invite/${token}`, expiresAt }))
+      : false;
+    res.status(201).json({ token, expiresAt, email, emailed });
   });
+
+  // --- Résumé par email des notifications restées non lues ------------------
+
+  async function runEmailDigest(now = Date.now()) {
+    if (!mail) return 0;
+    const rows = q.digestCandidates.all(now - DIGEST_DELAY_MS, now - DIGEST_MIN_INTERVAL_MS);
+    const byUser = Map.groupBy(rows, (r) => r.user_id);
+    let sent = 0;
+    for (const [userId, list] of byUser) {
+      // Quelqu'un qui a l'application sous les yeux n'a pas besoin d'email.
+      if (hub.isActive(userId)) continue;
+      const user = q.fullUser.get(userId);
+      const items = list.slice(-10).reverse().map((row) => {
+        const n = toNotification(row);
+        return { title: notificationTitle(n), excerpt: n.excerpt, url: `${appUrl}${messageUrl(n.channelId, n.parentId)}` };
+      });
+      const ok = await sendMail(user.email, digestEmail({
+        name: user.name, items, more: list.length - items.length, appUrl: `${appUrl}/`, settingsUrl: `${appUrl}/`,
+      }));
+      if (!ok) continue;
+      q.markEmailed.run(now, JSON.stringify(list.map((r) => r.id)));
+      q.setLastDigest.run(now, userId);
+      sent += 1;
+    }
+    return sent;
+  }
+  app.locals.runEmailDigest = runEmailDigest;
+  if (mail) setInterval(() => runEmailDigest().catch((err) => console.warn('Résumé email :', err.message)), 5 * 60 * 1000).unref();
 
   // --- Canaux et messages ----------------------------------------------------
 

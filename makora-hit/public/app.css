@@ -118,7 +118,7 @@ input:focus-visible, textarea:focus-visible, button:focus-visible {
 
 /* --- Authentification --- */
 
-.auth { min-height: 100%; display: grid; place-items: center; padding: 24px 16px; background: var(--bg-soft); }
+.auth { min-height: 100vh; min-height: 100dvh; display: grid; place-items: center; padding: 24px 16px; background: var(--bg-soft); }
 .auth-card {
   width: 100%;
   max-width: 400px;
@@ -648,6 +648,14 @@ button.me:hover { background: var(--sidebar-hover); }
 .admin-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .tips { padding-left: 18px; }
 .tips li { margin-bottom: 4px; }
+
+/* --- Connexion : SSO et liens --- */
+
+.btn.sso { text-align: center; text-decoration: none; color: var(--text); font-weight: 600; }
+.or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+.or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.link { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; }
+input[readonly] { background: var(--bg-soft); color: var(--muted); }
 
 /* --- Fenêtres et notifications --- */
 
