@@ -8,7 +8,9 @@ const escapeHtml = (s) => s
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&#39;');
 
-const SAFE_URL = /^(https?:\/\/|mailto:|#\/)/i;
+const SAFE_URL = /^(https?:\/\/|mailto:|#\/|\/api\/(page-files|attachments)\/\d+$)/i;
+// Images : uniquement les fichiers hébergés par l'application (pas d'image externe qui pisterait les lecteurs).
+const IMAGE_URL = /^\/api\/page-files\/\d+$/;
 
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const mentionCache = new Map();
@@ -31,8 +33,11 @@ function inline(raw, opts) {
   const keep = (html) => `\u0000${stash.push(html) - 1}\u0000`;
 
   let s = raw.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${escapeHtml(code)}</code>`));
+  s = s.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (m, alt, url) => (IMAGE_URL.test(url)
+    ? keep(`<a href="${url}" target="_blank" rel="noopener" class="md-image"><img src="${url}" alt="${escapeHtml(alt)}" loading="lazy"></a>`)
+    : m));
   s = s.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (m, label, url) => (SAFE_URL.test(url)
-    ? keep(`<a href="${escapeHtml(url)}"${url.startsWith('#') ? '' : ' target="_blank" rel="noopener noreferrer"'}>${escapeHtml(label)}</a>`)
+    ? keep(`<a href="${escapeHtml(url)}"${url.startsWith('#') || url.startsWith('/') ? '' : ' target="_blank" rel="noopener noreferrer"'}>${escapeHtml(label)}</a>`)
     : m));
   if (opts.mentions?.length) {
     s = s.replace(mentionRegex(opts.mentions), (m, before, name) => {

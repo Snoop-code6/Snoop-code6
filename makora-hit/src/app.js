@@ -184,7 +184,7 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     leave: db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?'),
     markRead: db.prepare('UPDATE channel_members SET last_read_id = MAX(last_read_id, ?) WHERE channel_id = ? AND user_id = ?'),
     channelsFor: db.prepare(`
-      SELECT c.id, c.name, c.topic, c.is_dm, c.is_private, c.created_by, m.user_id IS NOT NULL AS joined,
+      SELECT c.id, c.name, c.topic, c.is_dm, c.is_private, c.created_by, m.user_id IS NOT NULL AS joined, m.notify,
         (SELECT COUNT(*) FROM channel_members x WHERE x.channel_id = c.id) AS member_count,
         CASE WHEN m.user_id IS NULL THEN 0 ELSE (
           SELECT COUNT(*) FROM messages x
@@ -256,6 +256,16 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     updatePage: db.prepare(`UPDATE pages SET parent_id = ?, title = ?, content = ?, version = version + 1,
       updated_by = ?, updated_at = ? WHERE id = ? AND version = ?`),
     deletePage: db.prepare('DELETE FROM pages WHERE id = ?'),
+    setNotify: db.prepare('UPDATE channel_members SET notify = ? WHERE channel_id = ? AND user_id = ?'),
+    membersWithNotify: db.prepare('SELECT user_id, notify FROM channel_members WHERE channel_id = ?'),
+    insertPageFile: db.prepare(`INSERT INTO page_files (page_id, user_id, name, mime, size, storage_key, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`),
+    pageFile: db.prepare('SELECT * FROM page_files WHERE id = ?'),
+    pageFiles: db.prepare('SELECT * FROM page_files WHERE page_id = ? ORDER BY id'),
+    deletePageFile: db.prepare('DELETE FROM page_files WHERE id = ?'),
+    // Fichiers d'une page et de toutes ses sous-pages (supprimés avec elles).
+    pageTreeFiles: db.prepare(`WITH RECURSIVE tree(id) AS (SELECT ?1 UNION ALL SELECT p.id FROM pages p JOIN tree ON p.parent_id = tree.id)
+      SELECT storage_key FROM page_files WHERE page_id IN (SELECT id FROM tree)`),
     searchMessages: db.prepare(`
       SELECT m.* FROM messages m
       JOIN channels c ON c.id = m.channel_id
@@ -290,7 +300,7 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
       id: c.id, name: c.name, topic: c.topic, isDm: Boolean(c.is_dm), isPrivate: Boolean(c.is_private),
       createdBy: c.created_by, memberCount: c.member_count ?? q.memberCount.get(c.id).n,
       dmUserId: c.is_dm ? dmPartner(c, userId) : null,
-      joined: Boolean(c.joined), unread: c.unread ?? 0,
+      joined: Boolean(c.joined), unread: c.unread ?? 0, notify: c.notify ?? null,
     };
   }
 
@@ -397,39 +407,44 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     return !isRestricted(channel) || Boolean(q.member.get(channel.id, userId));
   }
 
+  // Réglage effectif d'un membre : 'all', 'mentions' ou 'none'.
+  const notifyLevel = (channel, notify) => notify ?? (channel.is_dm ? 'all' : 'mentions');
+
   // Une seule notification par personne et par message : la mention l'emporte sur la réponse dans un fil.
+  // Un canal muet ne notifie plus @tous ni les réponses, mais une mention directe passe toujours.
   function notifyForMessage(message, channel, author) {
+    const levels = new Map(q.membersWithNotify.all(channel.id).map((m) => [m.user_id, notifyLevel(channel, m.notify)]));
     const targets = new Map();
     const users = q.activeUsers.all();
     const names = [...users.map((u) => u.name), EVERYONE];
     for (const match of message.body.matchAll(mentionRegex(names))) {
       const name = match[2].toLowerCase();
       if (name === EVERYONE) {
-        for (const { user_id: id } of q.members.all(channel.id)) targets.set(id, 'mention');
+        for (const [id, level] of levels) if (level !== 'none') targets.set(id, 'mention');
       } else {
         for (const u of users) if (u.name.toLowerCase() === name) targets.set(u.id, 'mention');
       }
     }
     if (message.parentId) {
       for (const { user_id: id } of q.threadParticipants.all(message.parentId)) {
-        if (!targets.has(id)) targets.set(id, 'reply');
+        if (!targets.has(id) && levels.get(id) !== 'none') targets.set(id, 'reply');
       }
     }
     targets.delete(author.id);
     for (const [userId, kind] of targets) {
       if (canRead(channel, userId)) notify(userId, kind, author.id, message.id);
     }
-    // Un message privé n'a pas besoin de mention pour mériter un push.
-    if (channel.is_dm) {
-      const other = dmPartner(channel, author.id);
-      if (!targets.has(other)) {
-        pushTo(other, {
-          title: author.name,
-          body: message.body.replace(/\s+/g, ' ').slice(0, 160) || '📎 Pièce jointe',
-          url: messageUrl(channel.id, message.parentId),
-          tag: `dm-${channel.id}`,
-        });
-      }
+    // Réglage « tous les messages » (par défaut pour les messages privés) : un push même sans mention.
+    // Les réponses dans un fil n'en déclenchent pas, sauf pour ceux qui y participent (déjà notifiés).
+    if (message.parentId) return;
+    for (const [userId, level] of levels) {
+      if (level !== 'all' || userId === author.id || targets.has(userId)) continue;
+      pushTo(userId, {
+        title: channel.is_dm ? author.name : `${author.name} ${channelLabel(channel)}`,
+        body: message.body.replace(/\s+/g, ' ').slice(0, 160) || '📎 Pièce jointe',
+        url: messageUrl(channel.id, null),
+        tag: `channel-${channel.id}`,
+      });
     }
   }
 
@@ -878,6 +893,15 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     res.status(204).end();
   });
 
+  api.put('/channels/:id/notify', (req, res) => {
+    const channel = readableChannel(intParam(req.params.id), req.user);
+    const level = req.body?.level;
+    if (![null, 'all', 'mentions', 'none'].includes(level)) fail(400, 'Réglage invalide.');
+    if (!q.member.get(channel.id, req.user.id)) fail(403, 'Rejoignez le canal pour régler ses notifications.');
+    q.setNotify.run(level, channel.id, req.user.id);
+    res.json({ notify: level, level: notifyLevel(channel, level) });
+  });
+
   api.post('/channels/:id/read', (req, res) => {
     const channel = readableChannel(intParam(req.params.id), req.user);
     q.markRead.run(Number(req.body?.messageId) || 0, channel.id, req.user.id);
@@ -1017,9 +1041,11 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     res.json({ message: toMessage(root), replies: toMessages(q.replies.all(root.id)) });
   });
 
+  const rawUpload = express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES });
+
   // Le fichier arrive brut dans le corps de la requête ; son nom et son type sont dans les en-têtes.
-  api.post('/channels/:id/attachments', express.raw({ type: () => true, limit: MAX_UPLOAD_BYTES }), (req, res) => {
-    const channel = readableChannel(intParam(req.params.id), req.user);
+  // Il est enregistré sous un nom aléatoire ; renvoie ses métadonnées.
+  function storeUpload(req) {
     if (!Buffer.isBuffer(req.body) || req.body.length === 0) fail(400, 'Fichier vide.');
     let name;
     try {
@@ -1033,7 +1059,27 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
       : 'application/octet-stream';
     const key = newToken();
     writeFileSync(join(uploadDir, key), req.body);
-    const id = q.insertAttachment.run(channel.id, req.user.id, name, mime, req.body.length, key, Date.now()).lastInsertRowid;
+    return { name, mime, size: req.body.length, key };
+  }
+
+  // Seules les images sûres s'affichent ; tout le reste est forcé en téléchargement, dans un bac à sable.
+  function serveFile(res, file) {
+    const inline = INLINE_IMAGES.has(file.mime);
+    res.set({
+      'Content-Type': inline ? file.mime : 'application/octet-stream',
+      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(file.name)}`,
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Cache-Control': 'private, max-age=86400',
+    });
+    res.sendFile(join(uploadDir, file.storage_key), { cacheControl: false }, (err) => {
+      if (err && !res.headersSent) res.status(404).json({ error: 'Fichier introuvable.' });
+    });
+  }
+
+  api.post('/channels/:id/attachments', rawUpload, (req, res) => {
+    const channel = readableChannel(intParam(req.params.id), req.user);
+    const f = storeUpload(req);
+    const id = q.insertAttachment.run(channel.id, req.user.id, f.name, f.mime, f.size, f.key, Date.now()).lastInsertRowid;
     res.status(201).json({ attachment: toAttachment(q.attachment.get(id)) });
   });
 
@@ -1043,16 +1089,43 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     readableChannel(a.channel_id, req.user);
     // Tant qu'il n'est pas publié, un fichier n'est visible que de la personne qui l'a envoyé.
     if (!a.message_id && a.user_id !== req.user.id) fail(404, 'Fichier introuvable.');
-    const inline = INLINE_IMAGES.has(a.mime);
-    res.set({
-      'Content-Type': inline ? a.mime : 'application/octet-stream',
-      'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(a.name)}`,
-      'Content-Security-Policy': "default-src 'none'; sandbox",
-      'Cache-Control': 'private, max-age=86400',
-    });
-    res.sendFile(join(uploadDir, a.storage_key), { cacheControl: false }, (err) => {
-      if (err && !res.headersSent) res.status(404).json({ error: 'Fichier introuvable.' });
-    });
+    serveFile(res, a);
+  });
+
+  // --- Fichiers des pages (les pages sont visibles de toute l'équipe) ---------
+
+  const toPageFile = (f) => ({ id: f.id, pageId: f.page_id, userId: f.user_id, name: f.name, mime: f.mime, size: f.size, createdAt: f.created_at });
+
+  api.post('/pages/:id/files', rawUpload, (req, res) => {
+    const page = q.page.get(intParam(req.params.id));
+    if (!page) fail(404, 'Page introuvable.');
+    const f = storeUpload(req);
+    const id = q.insertPageFile.run(page.id, req.user.id, f.name, f.mime, f.size, f.key, Date.now()).lastInsertRowid;
+    const file = toPageFile(q.pageFile.get(id));
+    hub.broadcast({ type: 'page:files', pageId: page.id });
+    res.status(201).json({ file, url: `/api/page-files/${id}` });
+  });
+
+  api.get('/pages/:id/files', (req, res) => {
+    const page = q.page.get(intParam(req.params.id));
+    if (!page) fail(404, 'Page introuvable.');
+    res.json({ files: q.pageFiles.all(page.id).map(toPageFile) });
+  });
+
+  api.get('/page-files/:id', (req, res) => {
+    const file = q.pageFile.get(intParam(req.params.id));
+    if (!file) fail(404, 'Fichier introuvable.');
+    serveFile(res, file);
+  });
+
+  api.delete('/page-files/:id', (req, res) => {
+    const file = q.pageFile.get(intParam(req.params.id));
+    if (!file) fail(404, 'Fichier introuvable.');
+    if (file.user_id !== req.user.id && req.user.role !== 'admin') fail(403, 'Seul l’auteur du fichier ou un administrateur peut le supprimer.');
+    q.deletePageFile.run(file.id);
+    removeFiles([file.storage_key]);
+    hub.broadcast({ type: 'page:files', pageId: file.page_id });
+    res.status(204).end();
   });
 
   api.patch('/messages/:id', (req, res) => {
@@ -1199,7 +1272,9 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     if (page.created_by !== req.user.id && req.user.role !== 'admin') {
       fail(403, 'Seul l’auteur de la page ou un administrateur peut la supprimer.');
     }
+    const files = q.pageTreeFiles.all(page.id).map((f) => f.storage_key);
     q.deletePage.run(page.id);
+    removeFiles(files);
     hub.broadcast({ type: 'page:deleted', pageId: page.id });
     res.status(204).end();
   });

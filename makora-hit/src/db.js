@@ -131,6 +131,19 @@ CREATE TABLE IF NOT EXISTS page_versions (
 );
 CREATE INDEX IF NOT EXISTS page_versions_page ON page_versions(page_id, id);
 
+-- Fichiers insérés dans les pages (images affichées, autres fichiers à télécharger).
+CREATE TABLE IF NOT EXISTS page_files (
+  id          INTEGER PRIMARY KEY,
+  page_id     INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  name        TEXT NOT NULL,
+  mime        TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  storage_key TEXT NOT NULL UNIQUE,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS page_files_page ON page_files(page_id);
+
 -- Abonnements aux notifications push (un par appareil).
 CREATE TABLE IF NOT EXISTS push_subscriptions (
   id         INTEGER PRIMARY KEY,
@@ -182,6 +195,9 @@ function migrate(db) {
   addColumn(db, 'users', 'last_digest_at', 'INTEGER');
   addColumn(db, 'invites', 'email', 'TEXT');
   addColumn(db, 'notifications', 'emailed_at', 'INTEGER');
+  // Préférence de notification par canal : NULL = réglage par défaut (tout pour les messages privés,
+  // mentions pour les canaux), 'all', 'mentions' ou 'none' (muet).
+  addColumn(db, 'channel_members', 'notify', 'TEXT');
 
   const channelColumns = db.prepare('PRAGMA table_info(channels)').all().map((c) => c.name);
   if (!channelColumns.includes('is_private')) {

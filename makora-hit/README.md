@@ -17,11 +17,13 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 - **Réactions emoji** : pastilles cliquables sous les messages, sélecteur d'emojis
 - **@mentions** avec autocomplétion (`@Prénom Nom`, ou `@tous` pour prévenir tout le canal)
 - Mise en forme Markdown : **gras**, *italique*, `code`, listes, liens
+- **Notifications réglables par canal** : tous les messages, mentions uniquement (par défaut) ou muet (plus de compteur ; une mention directe passe toujours)
 - Historique paginé
 
 **Pages**
 - Pages et sous-pages, en arborescence dans la barre latérale
 - Édition en Markdown avec aperçu, titres, listes de tâches, citations, blocs de code
+- **Images et fichiers dans les pages** : bouton, glisser-déposer ou copier-coller d'une capture ; les images s'affichent dans la page, les autres fichiers se téléchargent ; liste des fichiers de chaque page
 - Enregistrement automatique
 - Gestion des conflits : si deux personnes modifient la même page, personne n'écrase le travail de l'autre
 - Mise à jour en direct quand un collègue modifie la page ouverte
@@ -171,7 +173,5 @@ test/
 
 ## Pistes pour la suite
 
-- Pièces jointes dans les pages
-- Préférences de notification par canal (muet, mentions uniquement)
 - Renommer / archiver un canal
 - Éditeur de pages par blocs (WYSIWYG)

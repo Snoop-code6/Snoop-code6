@@ -116,6 +116,9 @@ const userName = (id) => state.users.get(id)?.name ?? 'Utilisateur supprimé';
 const activeColleagues = () => [...state.users.values()].filter((u) => u.id !== state.me.id && u.active !== false);
 const channelTitle = (c) => (c.isDm ? userName(c.dmUserId) : `${c.isPrivate ? '🔒' : '#'} ${c.name}`);
 const channelRef = (c) => (c.isPrivate ? `🔒${c.name}` : `#${c.name}`);
+// Réglage effectif : 'all', 'mentions' ou 'none' (muet).
+const notifyLevel = (c) => c.notify ?? (c.isDm ? 'all' : 'mentions');
+const isMuted = (c) => notifyLevel(c) === 'none';
 const pageTitle = (p) => p?.title?.trim() || 'Sans titre';
 const EVERYONE = 'tous';
 
@@ -408,8 +411,9 @@ function onEvent(ev) {
         resync();
         break;
       }
-      if (channel.isDm && m.userId !== state.me.id) {
-        desktopNotify(userName(m.userId), m.body || '📎 Pièce jointe', m.parentId ? `#/c/${m.channelId}/t/${m.parentId}` : `#/c/${m.channelId}`);
+      if (notifyLevel(channel) === 'all' && channel.joined && !m.parentId && m.userId !== state.me.id) {
+        desktopNotify(channel.isDm ? userName(m.userId) : `${userName(m.userId)} dans ${channelRef(channel)}`,
+          m.body || '📎 Pièce jointe', `#/c/${m.channelId}`);
       }
       if (m.parentId) {
         if (v?.kind === 'channel' && v.id === m.channelId) addReply(v, m);
@@ -441,6 +445,9 @@ function onEvent(ev) {
       state.pages.set(ev.page.id, ev.page);
       renderSidebar();
       if (v?.kind === 'page' && v.id === ev.page.id && ev.by !== state.me.id) onRemotePageChange(v, ev);
+      break;
+    case 'page:files':
+      if (v?.kind === 'page' && v.id === ev.pageId) loadPageFiles(v);
       break;
     case 'page:deleted': {
       const removed = new Set([ev.pageId, ...descendants(ev.pageId)]);
@@ -531,10 +538,15 @@ function renderSidebar() {
   const active = (kind, id) => v?.kind === kind && v.id === id;
   const all = [...state.channels.values()];
 
+  // Un canal muet reste accessible mais n'affiche plus de compteur.
   const channelItem = (c, label) => h('li', {},
-    h('a', { href: `#/c/${c.id}`, class: `nav-item${active('channel', c.id) ? ' active' : ''}${c.unread ? ' unread' : ''}` },
-      label,
-      c.unread > 0 && h('span', { class: 'badge' }, c.unread > 99 ? '99+' : c.unread)));
+    h('a', {
+      href: `#/c/${c.id}`,
+      class: `nav-item${active('channel', c.id) ? ' active' : ''}${c.unread && !isMuted(c) ? ' unread' : ''}${isMuted(c) ? ' muted-channel' : ''}`,
+    },
+    label,
+    isMuted(c) && h('span', { class: 'muted-icon', title: 'Notifications désactivées' }, '🔕'),
+    c.unread > 0 && !isMuted(c) && h('span', { class: 'badge' }, c.unread > 99 ? '99+' : c.unread)));
 
   els.channels.replaceChildren(...all.filter((c) => !c.isDm && c.joined)
     .map((c) => channelItem(c, h('span', { class: 'label' }, h('span', { class: 'hash' }, c.isPrivate ? '🔒' : '#'), c.name))));
@@ -570,7 +582,7 @@ function renderSidebar() {
     state.notifUnread > 0 && h('span', { class: 'badge' }, state.notifUnread > 99 ? '99+' : state.notifUnread)),
   installPrompt && h('button', { class: 'nav-item install', onclick: () => installButton()?.click() }, h('span', { class: 'label' }, '📲 Installer l’application'))));
 
-  const unread = all.reduce((n, c) => n + (c.joined ? c.unread : 0), 0) + state.notifUnread;
+  const unread = all.reduce((n, c) => n + (c.joined && !isMuted(c) ? c.unread : 0), 0) + state.notifUnread;
   document.title = `${unread ? `(${unread}) ` : ''}MAKORA HIT`;
 }
 
@@ -720,6 +732,12 @@ function renderChannelHeader(v) {
   const c = state.channels.get(v.id);
   if (!c) return;
   const actions = [];
+  if (c.joined) {
+    const icons = { all: '🔔', mentions: '@', none: '🔕' };
+    actions.push(h('button', {
+      class: 'btn small', title: 'Notifications de ce canal', 'aria-label': 'Notifications de ce canal', onclick: () => openNotifyDialog(c),
+    }, icons[notifyLevel(c)]));
+  }
   if (!c.isDm) {
     actions.push(h('button', {
       class: 'btn small', title: 'Membres du canal', 'aria-label': `${c.memberCount} membres`, onclick: () => openMembersDialog(c),
@@ -1355,6 +1373,7 @@ function renderPage(v) {
   });
 
   v.bodyEl = h('div', { class: 'page-body' });
+  v.filesEl = h('div', {});
   v.banner = h('div', { class: 'banner', hidden: true });
 
   els.main.replaceChildren(
@@ -1373,6 +1392,7 @@ function renderPage(v) {
         v.titleInput,
         h('p', { class: 'muted small page-meta' }, `Modifié par ${userName(page.updatedBy)} · ${dateTimeFmt.format(page.updatedAt)}`),
         v.bodyEl,
+        v.filesEl,
         renderSubpages(page.id))));
   setMode(v, v.mode);
   updateStatus(v);
@@ -1389,6 +1409,7 @@ function setMode(v, mode) {
   v.mode = mode;
   v.modeBtn.textContent = mode === 'edit' ? 'Aperçu' : 'Modifier';
   if (mode === 'edit') {
+    loadPageFiles(v);
     const area = h('textarea', {
       class: 'page-editor', value: v.content, 'aria-label': 'Contenu de la page',
       placeholder: 'Écrivez ici… (Markdown : # Titre, **gras**, - liste, - [ ] tâche, ``` code ```)',
@@ -1398,11 +1419,38 @@ function setMode(v, mode) {
       area.style.height = 'auto';
       area.style.height = `${Math.max(area.scrollHeight, 300)}px`;
     };
-    v.bodyEl.replaceChildren(area);
+    const picker = h('input', {
+      type: 'file', multiple: true, hidden: true,
+      onchange: (e) => { addFilesToPage(v, area, [...e.target.files]); e.target.value = ''; },
+    });
+    area.addEventListener('paste', (e) => {
+      if (e.clipboardData?.files.length) {
+        e.preventDefault();
+        addFilesToPage(v, area, [...e.clipboardData.files]);
+      }
+    });
+    area.addEventListener('dragover', (e) => {
+      if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); area.classList.add('dragging'); }
+    });
+    area.addEventListener('dragleave', () => area.classList.remove('dragging'));
+    area.addEventListener('drop', (e) => {
+      if (!e.dataTransfer.files.length) return;
+      e.preventDefault();
+      area.classList.remove('dragging');
+      area.focus();
+      addFilesToPage(v, area, [...e.dataTransfer.files]);
+    });
+    v.bodyEl.replaceChildren(
+      h('div', { class: 'editor-toolbar' },
+        h('button', { class: 'btn small', type: 'button', onclick: () => picker.click() }, '📎 Insérer une image ou un fichier'),
+        h('span', { class: 'muted small' }, 'ou glissez-déposez, ou collez une capture d’écran'),
+        picker),
+      area);
     queueMicrotask(autosize);
     if (document.activeElement !== v.titleInput) area.focus();
   } else {
     const html = renderMarkdown(v.content);
+    if (v.filesEl) loadPageFiles(v);
     v.bodyEl.replaceChildren(html
       ? h('div', { class: 'md page-md', html, ondblclick: () => setMode(v, 'edit') })
       : h('p', { class: 'muted' }, 'Page vide. Cliquez sur « Modifier » pour écrire.'));
@@ -2292,6 +2340,120 @@ function renderAdmin(v) {
         h('li', {}, 'Un compte désactivé est déconnecté partout immédiatement ; ses messages et pages restent visibles.'),
         h('li', {}, 'Il reste toujours au moins un administrateur, et personne ne peut retirer ses propres droits.'),
         h('li', {}, 'Les administrateurs ne voient pas les canaux privés dont ils ne sont pas membres.')))));
+}
+
+// --- Réglage des notifications d'un canal --------------------------------------
+
+function openNotifyDialog(c) {
+  const defaultLabel = c.isDm ? 'Tous les messages' : 'Mentions uniquement';
+  const options = [
+    ['all', '🔔 Tous les messages', 'Une notification pour chaque nouveau message (hors réponses dans les fils).'],
+    ['mentions', '@ Mentions uniquement', 'Quand on vous mentionne, qu’on écrit @tous ou qu’on répond dans un fil où vous participez.'],
+    ['none', '🔕 Muet', 'Plus de compteur ni de notification, sauf si on vous mentionne directement.'],
+  ];
+  const current = notifyLevel(c);
+  const dlg = dialog(`Notifications : ${c.isDm ? userName(c.dmUserId) : channelRef(c)}`,
+    h('div', { class: 'stack', role: 'radiogroup' }, options.map(([level, label, help]) => h('label', { class: 'check option' },
+      h('input', {
+        type: 'radio', name: 'notify', value: level, checked: level === current,
+        onchange: async () => {
+          // Revenir au réglage par défaut plutôt que de le figer : il suit ainsi d'éventuelles évolutions.
+          const isDefault = level === (c.isDm ? 'all' : 'mentions');
+          try {
+            const res = await api('PUT', `/channels/${c.id}/notify`, { level: isDefault ? null : level });
+            c.notify = res.notify;
+            renderSidebar();
+            if (state.view?.kind === 'channel' && state.view.id === c.id) renderChannelHeader(state.view);
+            dlg.close();
+            toast(`${label.slice(2).trim()} pour ${c.isDm ? userName(c.dmUserId) : channelRef(c)}.`, 'info');
+          } catch (err) { report(err); }
+        },
+      }),
+      h('span', {}, h('strong', {}, label, level === (c.isDm ? 'all' : 'mentions') && h('span', { class: 'muted small' }, ' (par défaut)')),
+        h('span', { class: 'muted small block' }, help))))),
+    h('p', { class: 'muted small' }, `Par défaut : ${defaultLabel.toLowerCase()}. Les notifications push et par email suivent ce réglage.`));
+}
+
+// --- Fichiers dans les pages -----------------------------------------------------
+
+async function uploadPageFile(pageId, file) {
+  return parseResponse(await fetch(`/api/pages/${pageId}/files`, {
+    method: 'POST',
+    headers: {
+      'X-Makora': '1',
+      'Content-Type': 'application/octet-stream',
+      'X-Filename': encodeURIComponent(file.name),
+      'X-File-Type': file.type || 'application/octet-stream',
+    },
+    body: file,
+  }));
+}
+
+// Markdown inséré dans la page : les images s'affichent, les autres fichiers deviennent un lien.
+function fileMarkdown(file, url) {
+  const label = file.name.replace(/[[\]]/g, '');
+  return INLINE_IMAGES.has(file.mime) ? `![${label}](${url})` : `[📎 ${label} (${formatSize(file.size)})](${url})`;
+}
+
+function insertIntoEditor(v, area, text, { replace } = {}) {
+  if (replace !== undefined) {
+    area.value = area.value.replace(replace, text);
+  } else {
+    const start = area.selectionStart ?? area.value.length;
+    const before = area.value.slice(0, start);
+    const pad = before && !before.endsWith('\n') ? '\n' : '';
+    area.value = `${before}${pad}${text}\n${area.value.slice(area.selectionEnd ?? start)}`;
+    const pos = before.length + pad.length + text.length + 1;
+    area.setSelectionRange(pos, pos);
+  }
+  v.content = area.value;
+  area.dispatchEvent(new Event('input'));
+}
+
+let uploadSeq = 0;
+
+async function addFilesToPage(v, area, files) {
+  for (const file of files) {
+    if (file.size > state.limits.maxUploadBytes) {
+      toast(`« ${file.name} » est trop volumineux (${formatSize(state.limits.maxUploadBytes)} maximum).`);
+      continue;
+    }
+    // Repère temporaire à l'endroit du curseur, remplacé une fois le fichier envoyé.
+    const marker = `⏳ Envoi de ${file.name}… [${++uploadSeq}]`;
+    insertIntoEditor(v, area, marker);
+    try {
+      const res = await uploadPageFile(v.id, file);
+      insertIntoEditor(v, area, fileMarkdown(res.file, res.url), { replace: marker });
+    } catch (err) {
+      insertIntoEditor(v, area, '', { replace: `${marker}\n` });
+      report(err);
+    }
+  }
+}
+
+async function loadPageFiles(v) {
+  if (!v.filesEl) return;
+  try {
+    const { files } = await api('GET', `/pages/${v.id}/files`);
+    if (state.view !== v) return;
+    v.filesEl.replaceChildren(...nodes(files.length > 0 && h('div', { class: 'subpages' },
+      h('h3', { class: 'small muted' }, `Fichiers de la page (${files.length})`),
+      h('ul', { class: 'file-list' }, files.map((f) => h('li', {},
+        h('a', { href: `/api/page-files/${f.id}`, target: INLINE_IMAGES.has(f.mime) ? '_blank' : null, rel: 'noopener' },
+          fileIcon(f), ' ', f.name),
+        h('span', { class: 'muted small' }, ` ${formatSize(f.size)} · ${userName(f.userId)}`),
+        v.mode === 'edit' && h('button', {
+          class: 'icon-btn', title: 'Insérer dans la page', 'aria-label': `Insérer ${f.name} dans la page`,
+          onclick: () => { const area = v.bodyEl.querySelector('textarea'); if (area) insertIntoEditor(v, area, fileMarkdown(f, `/api/page-files/${f.id}`)); },
+        }, '↩'),
+        (f.userId === state.me.id || state.me.role === 'admin') && h('button', {
+          class: 'icon-btn', title: 'Supprimer le fichier', 'aria-label': `Supprimer ${f.name}`,
+          onclick: async () => {
+            if (!confirm(`Supprimer « ${f.name} » ? Les liens vers ce fichier dans la page ne fonctionneront plus.`)) return;
+            try { await api('DELETE', `/page-files/${f.id}`); loadPageFiles(v); } catch (err) { report(err); }
+          },
+        }, '🗑')))))));
+  } catch (err) { report(err); }
 }
 
 // --- Recherche --------------------------------------------------------------

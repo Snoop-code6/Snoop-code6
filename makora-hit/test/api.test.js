@@ -965,3 +965,143 @@ describe('gestion des comptes', () => {
     assert.equal((await client().call('GET', `/invites/${token}`)).data.valid, false);
   });
 });
+
+describe('préférences de notification par canal', () => {
+  let ids;
+  let channel;
+
+  before(async () => {
+    ids = {
+      admin: (await admin.call('GET', '/me')).data.user.id,
+      carol: (await carol.call('GET', '/me')).data.user.id,
+    };
+    channel = (await admin.call('POST', '/channels', { name: 'projet-beta', memberIds: [ids.carol] })).data.channel;
+    await carol.call('POST', '/push/subscribe', { subscription: { endpoint: 'https://push.example/carol-prefs', keys: { p256dh: 'B', auth: 'a' } } });
+    await carol.call('POST', '/notifications/read', {});
+  });
+
+  const settle = () => new Promise((r) => setTimeout(r, 50));
+  const unread = async () => (await carol.call('GET', '/notifications')).data.unread;
+
+  test('par défaut : mentions uniquement dans les canaux', async () => {
+    assert.equal((await carol.call('GET', '/channels')).data.channels.find((c) => c.id === channel.id).notify, null);
+    pushed.length = 0;
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: 'Message ordinaire' });
+    await settle();
+    assert.equal(pushed.length, 0);
+  });
+
+  test('« tous les messages » : un push pour chaque message du canal', async () => {
+    const res = await carol.call('PUT', `/channels/${channel.id}/notify`, { level: 'all' });
+    assert.deepEqual(res.data, { notify: 'all', level: 'all' });
+    pushed.length = 0;
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: 'Livraison demain 9h' });
+    await settle();
+    assert.equal(pushed.length, 1);
+    assert.equal(pushed[0].payload.title, 'Alice Martin dans #projet-beta');
+    assert.equal(pushed[0].payload.body, 'Livraison demain 9h');
+  });
+
+  test('muet : plus de @tous ni de réponses, mais une mention directe passe', async () => {
+    await carol.call('PUT', `/channels/${channel.id}/notify`, { level: 'none' });
+    pushed.length = 0;
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: 'Simple info' });
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: '@tous point à 14h' });
+    await settle();
+    assert.equal(pushed.length, 0);
+    assert.equal(await unread(), 0);
+
+    const root = (await carol.call('POST', `/channels/${channel.id}/messages`, { body: 'Ma question' })).data.message;
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: 'Ma réponse', parentId: root.id });
+    assert.equal(await unread(), 0);
+
+    await admin.call('POST', `/channels/${channel.id}/messages`, { body: '@Carol Petit urgent' });
+    assert.equal(await unread(), 1);
+  });
+
+  test('messages privés : « tous » par défaut, muet possible', async () => {
+    const { data: { channel: dm } } = await admin.call('POST', '/dms', { userId: ids.carol });
+    pushed.length = 0;
+    await admin.call('POST', `/channels/${dm.id}/messages`, { body: 'Tu as une minute ?' });
+    await settle();
+    assert.equal(pushed.length, 1);
+    await carol.call('PUT', `/channels/${dm.id}/notify`, { level: 'none' });
+    pushed.length = 0;
+    await admin.call('POST', `/channels/${dm.id}/messages`, { body: 'Relance' });
+    await settle();
+    assert.equal(pushed.length, 0);
+    await carol.call('PUT', `/channels/${dm.id}/notify`, { level: null });
+  });
+
+  test('réglage invalide ou canal non rejoint refusés', async () => {
+    assert.equal((await carol.call('PUT', `/channels/${channel.id}/notify`, { level: 'parfois' })).status, 400);
+    const other = (await admin.call('POST', '/channels', { name: 'sans-carol' })).data.channel;
+    assert.equal((await carol.call('PUT', `/channels/${other.id}/notify`, { level: 'all' })).status, 403);
+    await carol.call('POST', '/push/unsubscribe', { endpoint: 'https://push.example/carol-prefs' });
+  });
+});
+
+describe('fichiers des pages', () => {
+  let page;
+  const upload = (who, content, name, type) => fetch(`${base}/api/pages/${page.id}/files`, {
+    method: 'POST',
+    headers: { 'X-Makora': '1', Cookie: who.cookie, 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(name), 'X-File-Type': type },
+    body: content,
+  }).then(async (r) => ({ status: r.status, data: await r.json() }));
+
+  before(async () => {
+    page = (await bob.call('POST', '/pages', { title: 'Procédure qualité' })).data.page;
+  });
+
+  test('ajouter une image et un document à une page', async () => {
+    const png = Buffer.from('89504e470d0a1a0a', 'hex');
+    const img = await upload(bob, png, 'schéma.png', 'image/png');
+    assert.equal(img.status, 201);
+    assert.equal(img.data.url, `/api/page-files/${img.data.file.id}`);
+    const doc = await upload(bob, '%PDF-1.4', 'procédure.pdf', 'application/pdf');
+    const { files } = (await carol.call('GET', `/pages/${page.id}/files`)).data;
+    assert.deepEqual(files.map((f) => f.name), ['schéma.png', 'procédure.pdf']);
+
+    // Toute l'équipe peut les ouvrir ; seules les images s'affichent.
+    const shown = await fetch(`${base}${img.data.url}`, { headers: { Cookie: carol.cookie } });
+    assert.equal(shown.headers.get('content-type'), 'image/png');
+    const pdf = await fetch(`${base}${doc.data.url}`, { headers: { Cookie: carol.cookie } });
+    assert.match(pdf.headers.get('content-disposition'), /^attachment;/);
+    assert.equal((await fetch(`${base}${img.data.url}`)).status, 401);
+  });
+
+  test('suppression : auteur ou admin', async () => {
+    const f = (await upload(bob, 'brouillon', 'brouillon.txt', 'text/plain')).data.file;
+    assert.equal((await carol.call('DELETE', `/page-files/${f.id}`)).status, 403);
+    assert.equal((await bob.call('DELETE', `/page-files/${f.id}`)).status, 204);
+    assert.equal((await bob.call('GET', `/page-files/${f.id}`)).status, 404);
+  });
+
+  test('supprimer une page supprime ses fichiers et ceux des sous-pages', async () => {
+    const { readdirSync } = await import('node:fs');
+    const child = (await bob.call('POST', '/pages', { title: 'Annexe', parentId: page.id })).data.page;
+    await fetch(`${base}/api/pages/${child.id}/files`, {
+      method: 'POST',
+      headers: { 'X-Makora': '1', Cookie: bob.cookie, 'Content-Type': 'application/octet-stream', 'X-Filename': 'annexe.txt', 'X-File-Type': 'text/plain' },
+      body: 'annexe',
+    });
+    const before = readdirSync(srv.uploadDir).length;
+    assert.equal((await bob.call('DELETE', `/pages/${page.id}`)).status, 204);
+    assert.equal(readdirSync(srv.uploadDir).length, before - 3);
+  });
+});
+
+describe('markdown : images et fichiers', () => {
+  test('seules les images hébergées par l’application s’affichent', () => {
+    assert.match(renderMarkdown('![Plan](/api/page-files/3)'), /<img src="\/api\/page-files\/3" alt="Plan"/);
+    assert.ok(!renderMarkdown('![x](https://tracker.example/p.gif)').includes('<img'));
+    assert.ok(!renderMarkdown('![x](javascript:alert(1))').includes('<img'));
+    assert.ok(!/onerror="/.test(renderMarkdown('![x" onerror="alert(1)](/api/page-files/3)')));
+  });
+
+  test('liens internes vers les fichiers, sans chemins détournés', () => {
+    assert.match(renderMarkdown('[Devis](/api/page-files/4)'), /<a href="\/api\/page-files\/4">Devis<\/a>/);
+    assert.ok(!renderMarkdown('[x](/api/page-files/4/../../admin)').includes('<a'));
+    assert.ok(!renderMarkdown('[x](/admin)').includes('<a'));
+  });
+});
