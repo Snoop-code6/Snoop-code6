@@ -8,14 +8,18 @@ REPO=${MAKORA_REPO:-https://github.com/Snoop-code6/Snoop-code6}
 BRANCH=${MAKORA_BRANCH:-claude/discussion-dev-senior-hqdxna}
 DIR=${MAKORA_DIR:-$HOME/makora}
 
-say() { printf '\n\033[1;34m▶ %s\033[0m\n' "$1"; }
+STEP="démarrage"
+say() { STEP="$1"; printf '\n\033[1;34m▶ %s\033[0m\n' "$1"; }
+# En cas d'échec, on dit clairement où, au lieu de s'arrêter sans explication.
+trap 'printf "\n\033[1;31m✖ Échec pendant : %s\033[0m\nFaites une capture de cet écran et envoyez-la.\n" "$STEP"' ERR
 
-if ! command -v node >/dev/null || ! command -v git >/dev/null; then
-  say "Installation de Node.js et Git (quelques minutes la première fois)"
+# Depuis Node.js 25.3, Termux livre npm dans un paquet séparé : on installe les trois explicitement.
+if ! command -v node >/dev/null || ! command -v npm >/dev/null || ! command -v git >/dev/null; then
+  say "Installation de Node.js, npm et Git (quelques minutes la première fois)"
   export DEBIAN_FRONTEND=noninteractive
   pkg update -y -o Dpkg::Options::=--force-confnew
   pkg upgrade -y -o Dpkg::Options::=--force-confnew
-  pkg install -y nodejs git
+  pkg install -y nodejs npm git
 fi
 
 if ! node -e "require('node:sqlite')" 2>/dev/null; then
@@ -40,8 +44,10 @@ command -v termux-wake-lock >/dev/null && termux-wake-lock
 trap 'command -v termux-wake-unlock >/dev/null && termux-wake-unlock' EXIT
 
 say "MAKORA HIT démarre"
+trap - ERR
 cat <<'INFO'
-  → Sur ce téléphone, ouvrez Chrome à l'adresse :  http://localhost:3000
+  → Attendez la ligne « MAKORA HIT est lancé » ci-dessous, puis
+    sur ce téléphone, ouvrez Chrome à l'adresse :  http://localhost:3000
     (ou l'application MAKORA HIT avec l'adresse :  localhost:3000)
   → Laissez Termux ouvert en arrière-plan. Pour arrêter : revenez ici et faites Ctrl + C.
   → Vos données restent sur le téléphone, dans ~/makora/makora-hit/data.
