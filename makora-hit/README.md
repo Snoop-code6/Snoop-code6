@@ -106,6 +106,21 @@ L'adresse de retour à déclarer chez le fournisseur est `PUBLIC_URL` + `/api/au
 
 Le compte administrateur initial se crée toujours avec un mot de passe. Une personne déjà inscrite peut ensuite se connecter par SSO avec la même adresse ; un compte désactivé reste refusé.
 
+## Application Android (APK)
+
+Le dossier `android/` contient une petite application Android qui affiche MAKORA HIT en plein écran. Au premier lancement, elle demande l'adresse du serveur. Elle gère l'envoi de fichiers, le téléchargement des pièces jointes et le bouton retour ; un retour sur l'écran d'accueil de l'application permet de changer de serveur.
+
+```bash
+sudo apt-get install android-sdk-platform-23 aapt apksigner zipalign dalvik-exchange default-jdk
+./android/build.sh        # → android/build/makora-hit.apk
+```
+
+Limites par rapport à l'application installée depuis Chrome (PWA) :
+- **pas de notifications push** (Android ne les permet pas dans une application de ce type) ;
+- **pas de connexion « avec Google »** : Google interdit sa page de connexion dans les applications intégrées (la connexion par mot de passe fonctionne).
+
+Pour un usage quotidien, l'installation depuis Chrome (menu → Installer l'application) reste la meilleure option ; l'APK sert surtout à tester ou à distribuer l'application sans passer par le navigateur. La clé de signature est créée dans `android/build/` au premier lancement : conservez-la pour publier des mises à jour sans devoir désinstaller l'application.
+
 ## Mise en ligne sur un serveur
 
 Le plus simple : un petit serveur Linux (VPS à quelques euros par mois chez OVHcloud, Scaleway, Hetzner…) avec Docker, et un nom de domaine (ou sous-domaine) qui pointe vers lui.
@@ -154,6 +169,7 @@ src/
   auth.js      mots de passe (scrypt), sessions, cookies
   db.js        schéma SQLite
   backup.js    sauvegarde cohérente de la base
+android/       application Android (WebView) et son script de construction
 public/
   index.html, app.css, app.js   interface (JavaScript sans étape de build)
   markdown.js                   rendu Markdown sécurisé (partagé avec le serveur et les tests)
