@@ -121,6 +121,19 @@ Limites par rapport à l'application installée depuis Chrome (PWA) :
 
 Pour un usage quotidien, l'installation depuis Chrome (menu → Installer l'application) reste la meilleure option ; l'APK sert surtout à tester ou à distribuer l'application sans passer par le navigateur. La clé de signature est créée dans `android/build/` au premier lancement : conservez-la pour publier des mises à jour sans devoir désinstaller l'application.
 
+## Tester sur un téléphone Android, sans ordinateur ni hébergement
+
+Avec l'application **Termux**, le serveur tourne directement sur le téléphone :
+
+1. Installez Termux depuis [F-Droid](https://f-droid.org/packages/com.termux/) ou les [versions GitHub](https://github.com/termux/termux-app/releases) (fichier `…universal.apk`).
+2. Ouvrez Termux et collez :
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/Snoop-code6/Snoop-code6/claude/discussion-dev-senior-hqdxna/makora-hit/scripts/termux.sh | bash
+   ```
+3. Ouvrez `http://localhost:3000` dans Chrome (ou l'APK avec l'adresse `localhost:3000`).
+
+La même commande met l'application à jour et la relance. Les données restent sur le téléphone. Seul ce téléphone peut s'y connecter (ou les appareils du même Wi-Fi) : pour toute l'équipe, il faut un hébergement.
+
 ## Mise en ligne sur Railway (le plus simple)
 
 Tout se fait dans le navigateur, sans ligne de commande. Railway fournit une adresse HTTPS (`xxx.up.railway.app`).
