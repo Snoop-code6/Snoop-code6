@@ -442,9 +442,13 @@ function onEvent(ev) {
       onNotification(ev.notification);
       break;
     case 'page:changed':
-      state.pages.set(ev.page.id, ev.page);
+      // On complète la fiche existante (droits de modification compris) au lieu de la remplacer.
+      state.pages.set(ev.page.id, { canEdit: true, ...state.pages.get(ev.page.id), ...ev.page });
       renderSidebar();
       if (v?.kind === 'page' && v.id === ev.page.id && ev.by !== state.me.id) onRemotePageChange(v, ev);
+      break;
+    case 'pages:refresh':
+      refreshPages();
       break;
     case 'page:files':
       if (v?.kind === 'page' && v.id === ev.pageId) loadPageFiles(v);
@@ -568,7 +572,7 @@ function renderSidebar() {
           'aria-label': open ? 'Replier' : 'Déplier',
           onclick: () => toggleExpanded(p.id),
         }, '▸'),
-        h('a', { href: `#/p/${p.id}`, class: 'label' }, pageTitle(p)),
+        h('a', { href: `#/p/${p.id}`, class: 'label' }, pageTitle(p), p.restricted && h('span', { class: 'page-lock', title: 'Accès restreint' }, ' 🔒')),
         h('button', { class: 'icon-btn add-sub', title: 'Ajouter une sous-page', 'aria-label': 'Ajouter une sous-page', onclick: () => createPage(p.id) }, '+')));
     item.firstChild.style.paddingLeft = `${4 + depth * 14}px`;
     if (open && kids.length) item.append(h('ul', { class: 'nav-list' }, branch(p.id, depth + 1)));
@@ -1318,7 +1322,9 @@ function showLink(title, intro, link, expiresAt) {
 async function createPage(parentId) {
   try {
     const { page } = await api('POST', '/pages', { title: '', parentId });
-    state.pages.set(page.id, { id: page.id, parentId: page.parentId, title: page.title, updatedAt: page.updatedAt });
+    state.pages.set(page.id, {
+      id: page.id, parentId: page.parentId, title: page.title, updatedAt: page.updatedAt, restricted: page.restricted, canEdit: page.canEdit,
+    });
     if (parentId) toggleExpanded(parentId, true);
     pendingFocus = page.id;
     location.hash = `#/p/${page.id}`;
@@ -1338,7 +1344,8 @@ async function openPage(id) {
     v.page = page;
     v.title = page.title;
     v.content = page.content;
-    v.mode = page.content.trim() && pendingFocus !== id ? 'read' : 'edit';
+    v.mode = page.canEdit && (!page.content.trim() || pendingFocus === id) ? 'edit' : 'read';
+    readNotificationsWhere((n) => n.pageId === id);
     // Déplie l'arborescence jusqu'à la page ouverte.
     for (let p = state.pages.get(page.parentId); p; p = state.pages.get(p.parentId)) state.expanded.add(p.id);
     renderSidebar();
@@ -1363,6 +1370,7 @@ function renderPage(v) {
 
   v.titleInput = h('input', {
     class: 'page-title', value: v.title, placeholder: 'Sans titre', maxlength: 200, 'aria-label': 'Titre de la page',
+    readonly: !page.canEdit,
     oninput: (e) => { v.title = e.target.value; changed(v); },
     onkeydown: (e) => {
       if (e.key === 'Enter') {
@@ -1381,10 +1389,11 @@ function renderPage(v) {
       navButton(),
       h('nav', { class: 'crumbs small' }, crumbs, h('span', {}, pageTitle({ title: v.title }))),
       h('div', { class: 'head-actions' },
-        v.status,
-        v.modeBtn = h('button', { class: 'btn small', onclick: () => setMode(v, v.mode === 'edit' ? 'read' : 'edit') }),
+        page.canEdit ? v.status : h('span', { class: 'tag muted-tag' }, 'Lecture seule'),
+        v.modeBtn = h('button', { class: 'btn small', hidden: !page.canEdit, onclick: () => setMode(v, v.mode === 'edit' ? 'read' : 'edit') }),
+        h('button', { class: 'btn small', onclick: () => openShareDialog(v) }, page.restricted ? '🔒 Partager' : 'Partager'),
         h('button', { class: 'btn small', onclick: () => openHistory(v) }, 'Historique'),
-        h('button', { class: 'btn small', onclick: () => createPage(page.id) }, '+ Sous-page'),
+        page.canEdit && h('button', { class: 'btn small', onclick: () => createPage(page.id) }, '+ Sous-page'),
         canDelete && h('button', { class: 'btn small danger', onclick: () => deletePage(v) }, 'Supprimer'))),
     h('div', { class: 'page-scroll' },
       h('div', { class: 'page' },
@@ -1408,13 +1417,18 @@ function renderSubpages(id) {
 function setMode(v, mode) {
   v.mode = mode;
   v.modeBtn.textContent = mode === 'edit' ? 'Aperçu' : 'Modifier';
+  if (mode === 'edit' && !v.page.canEdit) mode = 'read';
+  v.mode = mode;
   if (mode === 'edit') {
     loadPageFiles(v);
     const area = h('textarea', {
       class: 'page-editor', value: v.content, 'aria-label': 'Contenu de la page',
-      placeholder: 'Écrivez ici… (Markdown : # Titre, **gras**, - liste, - [ ] tâche, ``` code ```)',
-      oninput: (e) => { v.content = e.target.value; changed(v); autosize(); },
+      placeholder: 'Écrivez ici… (Markdown : # Titre, **gras**, - liste, - [ ] tâche, @Nom pour mentionner quelqu’un)',
+      oninput: (e) => { v.content = e.target.value; changed(v); autosize(); mentions.update(); },
     });
+    // Mentions : la liste s'affiche en bas de l'écran (au-dessus du clavier sur téléphone).
+    const mentions = mentionPicker(area, { everyone: false, floating: true });
+    area.addEventListener('keydown', (e) => mentions.handleKey(e));
     const autosize = () => {
       area.style.height = 'auto';
       area.style.height = `${Math.max(area.scrollHeight, 300)}px`;
@@ -1443,17 +1457,18 @@ function setMode(v, mode) {
     v.bodyEl.replaceChildren(
       h('div', { class: 'editor-toolbar' },
         h('button', { class: 'btn small', type: 'button', onclick: () => picker.click() }, '📎 Insérer une image ou un fichier'),
-        h('span', { class: 'muted small' }, 'ou glissez-déposez, ou collez une capture d’écran'),
+        h('span', { class: 'muted small' }, 'ou glissez-déposez, ou collez une capture d’écran · @ pour mentionner'),
         picker),
-      area);
+      area,
+      mentions.el);
     queueMicrotask(autosize);
     if (document.activeElement !== v.titleInput) area.focus();
   } else {
-    const html = renderMarkdown(v.content);
+    const html = md(v.content);
     if (v.filesEl) loadPageFiles(v);
     v.bodyEl.replaceChildren(html
       ? h('div', { class: 'md page-md', html, ondblclick: () => setMode(v, 'edit') })
-      : h('p', { class: 'muted' }, 'Page vide. Cliquez sur « Modifier » pour écrire.'));
+      : h('p', { class: 'muted' }, v.page.canEdit ? 'Page vide. Cliquez sur « Modifier » pour écrire.' : 'Page vide.'));
   }
 }
 
@@ -1479,8 +1494,12 @@ async function savePage(v) {
   v.dirty = false;
   updateStatus(v);
   try {
-    const { page } = await api('PATCH', `/pages/${v.id}`, { title: v.title, content: v.content, version: v.page.version });
+    const { page, mentionedWithoutAccess } = await api('PATCH', `/pages/${v.id}`, { title: v.title, content: v.content, version: v.page.version });
     v.page = page;
+    if (mentionedWithoutAccess?.length) {
+      const many = mentionedWithoutAccess.length > 1;
+      toast(`${mentionedWithoutAccess.join(', ')} n’${many ? 'ont' : 'a'} pas accès à cette page et ne ${many ? 'seront' : 'sera'} pas prévenu${many ? '·es' : '·e'}. Utilisez « Partager » pour ${many ? 'leur' : 'lui'} donner accès.`, 'info');
+    }
     const summary = state.pages.get(page.id);
     if (summary) summary.title = page.title;
     renderSidebar();
@@ -1608,8 +1627,8 @@ function openEmojiPicker(anchor, onPick) {
 
 // --- Autocomplétion des @mentions ------------------------------------------------
 
-function mentionPicker(input) {
-  const el = h('ul', { class: 'mention-picker', role: 'listbox', hidden: true });
+function mentionPicker(input, { everyone = true, floating = false } = {}) {
+  const el = h('ul', { class: `mention-picker${floating ? ' floating' : ''}`, role: 'listbox', hidden: true });
   let items = [];
   let index = 0;
   let start = -1;
@@ -1621,7 +1640,7 @@ function mentionPicker(input) {
       .filter((u) => u.name.toLowerCase().startsWith(q) || u.name.toLowerCase().split(/\s+/).some((w) => w.startsWith(q)))
       .slice(0, 6)
       .map((u) => ({ value: u.name, label: u.name, id: u.id }));
-    if (EVERYONE.startsWith(q)) people.push({ value: EVERYONE, label: '@tous', hint: 'prévenir tout le canal' });
+    if (everyone && EVERYONE.startsWith(q)) people.push({ value: EVERYONE, label: '@tous', hint: 'prévenir tout le canal' });
     return people;
   }
 
@@ -1690,6 +1709,7 @@ function mentionPicker(input) {
 
 function notificationText(n, { withEmoji = true } = {}) {
   const who = userName(n.actorId);
+  if (n.kind === 'page_mention') return `${who} vous a mentionné dans la page « ${n.pageTitle || 'Sans titre'} »`;
   const c = state.channels.get(n.channelId);
   const where = c ? (c.isDm ? 'en message privé' : `dans ${channelRef(c)}`) : '';
   if (n.kind === 'mention') return `${who} vous a mentionné ${where}`;
@@ -1697,12 +1717,15 @@ function notificationText(n, { withEmoji = true } = {}) {
   return `${who} a réagi${withEmoji ? ` ${n.emoji}` : ''} à votre message ${where}`;
 }
 
-const notificationHash = (n) => (n.parentId ? `#/c/${n.channelId}/t/${n.parentId}` : `#/c/${n.channelId}`);
+const notificationHash = (n) => (n.pageId ? `#/p/${n.pageId}`
+  : n.parentId ? `#/c/${n.channelId}/t/${n.parentId}` : `#/c/${n.channelId}`);
 
 // La notification concerne-t-elle ce que la personne a sous les yeux en ce moment ?
 function isOnScreen(n) {
   const v = state.view;
-  if (document.visibilityState !== 'visible' || v?.kind !== 'channel' || v.id !== n.channelId) return false;
+  if (document.visibilityState !== 'visible') return false;
+  if (n.pageId) return v?.kind === 'page' && v.id === n.pageId;
+  if (v?.kind !== 'channel' || v.id !== n.channelId) return false;
   return n.parentId ? v.thread?.rootId === n.parentId : true;
 }
 
@@ -1813,7 +1836,7 @@ function renderActivity(v) {
   },
   avatar(n.actorId),
   h('div', { class: 'activity-body' },
-    h('div', {}, h('span', { class: 'activity-kind', 'aria-hidden': 'true' }, n.kind === 'mention' ? '@' : n.kind === 'reply' ? '💬' : n.emoji), ' ',
+    h('div', {}, h('span', { class: 'activity-kind', 'aria-hidden': 'true' }, { mention: '@', page_mention: '📄', reply: '💬' }[n.kind] ?? n.emoji), ' ',
       h('strong', {}, notificationText(n, { withEmoji: false }))),
     n.excerpt && h('div', { class: 'md muted', html: md(n.excerpt) }),
     h('time', { class: 'muted small', datetime: new Date(n.createdAt).toISOString() }, relativeTime(n.createdAt))),
@@ -2454,6 +2477,128 @@ async function loadPageFiles(v) {
           },
         }, '🗑')))))));
   } catch (err) { report(err); }
+}
+
+// --- Accès aux pages -----------------------------------------------------------------
+
+// Quelqu'un a changé des accès : on recharge les pages visibles. Si la page ouverte n'est plus
+// accessible, on la quitte ; sinon on met à jour ses droits (sans perdre une modification en cours).
+async function refreshPages() {
+  try {
+    const { pages } = await api('GET', '/pages');
+    state.pages = new Map(pages.map((p) => [p.id, p]));
+    renderSidebar();
+    const v = state.view;
+    if (v?.kind !== 'page' || !v.page) return;
+    if (!state.pages.has(v.id)) {
+      toast('Vous n’avez plus accès à cette page.', 'info');
+      location.hash = '';
+      return;
+    }
+    if (v.dirty || v.saving) return;
+    const { page } = await api('GET', `/pages/${v.id}`);
+    if (state.view !== v) return;
+    Object.assign(v, { page, title: page.title, content: page.content });
+    renderPage(v);
+  } catch (err) { report(err); }
+}
+
+const ACCESS_OPTIONS = [
+  ['edit', '👥 Toute l’équipe peut modifier', 'Tout le monde voit la page et peut la modifier.'],
+  ['view', '👀 Toute l’équipe peut lire', 'Tout le monde voit la page ; seules les personnes choisies la modifient.'],
+  ['private', '🔒 Privée', 'Seules les personnes choisies voient la page (et ses sous-pages).'],
+];
+
+async function openShareDialog(v) {
+  let data;
+  try {
+    data = await api('GET', `/pages/${v.id}/access`);
+  } catch (err) {
+    report(err);
+    return;
+  }
+  const hasParent = v.page.parentId != null;
+  // Sans réglage propre : « comme la page parente » pour une sous-page, « toute l'équipe » en haut de l'arbre.
+  let access = data.access ?? (hasParent ? 'inherit' : 'edit');
+  const members = new Map(data.members.map((m) => [m.userId, m.role]));
+  const ownerId = data.inheritedFrom ? data.owner : v.page.createdBy;
+  const body = h('div', { class: 'stack' });
+  const dlg = dialog(`Partager « ${pageTitle({ title: v.title })} »`, body);
+  dlg.classList.add('share');
+
+  const inheritLabel = data.inheritedFrom
+    ? `Comme la page parente « ${data.inheritedFrom.title || 'Sans titre'} » (${ACCESS_OPTIONS.find(([k]) => k === data.effective)[1].slice(2).toLowerCase()})`
+    : 'Comme la page parente (toute l’équipe peut modifier)';
+
+  function render() {
+    const restricted = access === 'view' || access === 'private';
+    const options = [
+      ...(hasParent ? [['inherit', '↳ Héritée', inheritLabel]] : []),
+      ...ACCESS_OPTIONS,
+    ];
+    const people = [...members.entries()]
+      .filter(([id]) => id !== ownerId)
+      .map(([id, role]) => ({ user: state.users.get(id) ?? { id, name: userName(id) }, role }))
+      .sort((a, b) => a.user.name.localeCompare(b.user.name));
+    const addable = activeColleagues().filter((u) => !members.has(u.id) && u.id !== ownerId);
+    const picker = h('select', { 'aria-label': 'Ajouter une personne' },
+      h('option', { value: '' }, '+ Ajouter une personne…'),
+      addable.map((u) => h('option', { value: u.id }, u.name)));
+    picker.addEventListener('change', () => {
+      if (!picker.value) return;
+      members.set(Number(picker.value), access === 'view' ? 'edit' : 'view');
+      render();
+    });
+
+    body.replaceChildren(...nodes(
+      !data.canManage && h('p', { class: 'notice' }, 'Seuls l’auteur de la page et les administrateurs peuvent modifier ces accès.'),
+      h('div', { class: 'stack tight', role: 'radiogroup', 'aria-label': 'Qui peut accéder à cette page ?' },
+        options.map(([key, label, help]) => h('label', { class: 'check option' },
+          h('input', {
+            type: 'radio', name: 'access', value: key, checked: access === key, disabled: !data.canManage,
+            onchange: () => { access = key; render(); },
+          }),
+          h('span', {}, h('strong', {}, label), h('span', { class: 'muted small block' }, help))))),
+      restricted && h('div', { class: 'stack tight' },
+        h('h3', {}, access === 'view' ? 'Personnes qui peuvent modifier' : 'Personnes qui ont accès'),
+        h('ul', { class: 'pick-list' },
+          h('li', {}, h('div', { class: 'person' }, avatar(ownerId), h('div', {},
+            h('strong', {}, userName(ownerId)), h('div', { class: 'muted small' }, 'Auteur · peut tout modifier')))),
+          people.map(({ user, role }) => h('li', {},
+            h('div', { class: 'person' }, avatar(user.id), h('strong', {}, user.name)),
+            h('div', { class: 'row' },
+              access === 'private' && h('select', {
+                'aria-label': `Droit de ${user.name}`, disabled: !data.canManage,
+                onchange: (e) => { members.set(user.id, e.target.value); },
+              },
+              h('option', { value: 'edit', selected: role === 'edit' }, 'Peut modifier'),
+              h('option', { value: 'view', selected: role === 'view' }, 'Peut lire')),
+              data.canManage && h('button', {
+                class: 'icon-btn', 'aria-label': `Retirer ${user.name}`, title: 'Retirer',
+                onclick: () => { members.delete(user.id); render(); },
+              }, '×'))))),
+        data.canManage && addable.length > 0 && picker),
+      data.canManage && h('button', { class: 'btn primary', onclick: save }, 'Enregistrer'),
+      h('p', { class: 'muted small' }, 'Les sous-pages suivent le réglage de leur page parente, sauf si elles ont le leur. Les administrateurs ne voient pas une page privée dont ils ne font pas partie.')));
+  }
+
+  async function save() {
+    const explicit = access === 'inherit' ? null : (access === 'edit' && !hasParent ? null : access);
+    const list = [...members.entries()].map(([userId, role]) => ({ userId, role: access === 'view' ? 'edit' : role }));
+    // Si je règle la page de quelqu'un d'autre, je m'ajoute pour ne pas en perdre l'accès.
+    if ((access === 'view' || access === 'private') && ownerId !== state.me.id && !members.has(state.me.id)) {
+      list.push({ userId: state.me.id, role: 'edit' });
+    }
+    try {
+      const { page } = await api('PUT', `/pages/${v.id}/access`, { access: explicit, members: list });
+      Object.assign(v, { page });
+      dlg.close();
+      renderPage(v);
+      toast(page.restricted ? 'Accès restreint enregistré.' : 'La page est accessible à toute l’équipe.', 'info');
+    } catch (err) { report(err); }
+  }
+
+  render();
 }
 
 // --- Recherche --------------------------------------------------------------

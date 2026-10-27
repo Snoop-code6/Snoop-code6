@@ -1105,3 +1105,177 @@ describe('markdown : images et fichiers', () => {
     assert.ok(!renderMarkdown('[x](/admin)').includes('<a'));
   });
 });
+
+describe('accès aux pages', () => {
+  let ids;
+  let secret;
+  let child;
+  const ws = (who) => socket(who.cookie);
+
+  before(async () => {
+    ids = {
+      admin: (await admin.call('GET', '/me')).data.user.id,
+      bob: (await bob.call('GET', '/me')).data.user.id,
+      carol: (await carol.call('GET', '/me')).data.user.id,
+    };
+    secret = (await bob.call('POST', '/pages', { title: 'Plan social confidentiel' })).data.page;
+    await bob.call('PATCH', `/pages/${secret.id}`, { content: 'Budget restructuration', version: secret.version });
+    child = (await bob.call('POST', '/pages', { title: 'Annexe RH', parentId: secret.id })).data.page;
+  });
+
+  test('par défaut, toute l’équipe voit et modifie', async () => {
+    const page = (await carol.call('GET', `/pages/${secret.id}`)).data.page;
+    assert.equal(page.canEdit, true);
+    assert.equal(page.restricted, false);
+  });
+
+  test('page privée : invisible partout pour les non-membres', async () => {
+    const carolWs = ws(carol);
+    await carolWs.opened;
+    const res = await bob.call('PUT', `/pages/${secret.id}/access`, {
+      access: 'private', members: [{ userId: ids.admin, role: 'view' }],
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.data.page.restricted, true);
+    await carolWs.next((e) => e.type === 'pages:refresh');
+
+    const carolPages = (await carol.call('GET', '/pages')).data.pages;
+    assert.ok(!carolPages.some((p) => p.id === secret.id));
+    assert.ok(!carolPages.some((p) => p.id === child.id), 'les sous-pages héritent de l’accès');
+    for (const path of [`/pages/${secret.id}`, `/pages/${child.id}`, `/pages/${secret.id}/versions`, `/pages/${secret.id}/files`, `/pages/${secret.id}/access`]) {
+      assert.equal((await carol.call('GET', path)).status, 404, path);
+    }
+    assert.equal((await carol.call('PATCH', `/pages/${secret.id}`, { content: 'x', version: 2 })).status, 404);
+    assert.equal((await carol.call('POST', '/pages', { title: 'Intrus', parentId: secret.id })).status, 404);
+    assert.equal((await carol.call('GET', '/search?q=restructuration')).data.pages.length, 0);
+
+    // Les modifications de la page ne sont pas diffusées à Carol.
+    const current = (await bob.call('GET', `/pages/${secret.id}`)).data.page;
+    await bob.call('PATCH', `/pages/${secret.id}`, { title: 'Plan social v2', version: current.version });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.ok(!carolWs.events.some((e) => e.type === 'page:changed' && e.page.id === secret.id));
+    carolWs.ws.close();
+  });
+
+  test('membre en lecture : voit sans pouvoir modifier', async () => {
+    const page = (await admin.call('GET', `/pages/${secret.id}`)).data.page;
+    assert.equal(page.canEdit, false);
+    assert.equal((await admin.call('PATCH', `/pages/${secret.id}`, { content: 'x', version: page.version })).status, 403);
+    assert.equal((await admin.call('GET', `/pages/${child.id}`)).data.page.canEdit, false);
+    assert.equal((await admin.call('GET', '/search?q=restructuration')).data.pages.length, 1);
+  });
+
+  test('fichiers d’une page privée inaccessibles aux autres', async () => {
+    const res = await fetch(`${base}/api/pages/${secret.id}/files`, {
+      method: 'POST',
+      headers: { 'X-Makora': '1', Cookie: bob.cookie, 'Content-Type': 'application/octet-stream', 'X-Filename': 'grille.txt', 'X-File-Type': 'text/plain' },
+      body: 'grille des salaires',
+    });
+    const { file } = await res.json();
+    const get = (who) => fetch(`${base}/api/page-files/${file.id}`, { headers: { Cookie: who.cookie } });
+    assert.equal((await get(carol)).status, 404);
+    assert.equal((await get(admin)).status, 200);
+    // Un membre en lecture ne peut pas ajouter de fichier.
+    const denied = await fetch(`${base}/api/pages/${secret.id}/files`, {
+      method: 'POST', headers: { 'X-Makora': '1', Cookie: admin.cookie, 'Content-Type': 'application/octet-stream' }, body: 'x',
+    });
+    assert.equal(denied.status, 403);
+  });
+
+  test('« toute l’équipe lit » : seuls les membres « modifier » écrivent', async () => {
+    await bob.call('PUT', `/pages/${secret.id}/access`, { access: 'view', members: [{ userId: ids.carol, role: 'edit' }] });
+    const forCarol = (await carol.call('GET', `/pages/${secret.id}`)).data.page;
+    assert.equal(forCarol.canEdit, true);
+    assert.equal((await admin.call('GET', `/pages/${secret.id}`)).data.page.canEdit, false);
+    const access = (await carol.call('GET', `/pages/${secret.id}/access`)).data;
+    assert.equal(access.effective, 'view');
+    assert.equal(access.canManage, false);
+    assert.equal((await carol.call('PUT', `/pages/${secret.id}/access`, { access: 'edit' })).status, 403);
+  });
+
+  test('une sous-page peut avoir son propre réglage', async () => {
+    const inherited = (await bob.call('GET', `/pages/${child.id}/access`)).data;
+    assert.equal(inherited.access, null);
+    assert.deepEqual(inherited.inheritedFrom, { id: secret.id, title: 'Plan social v2' });
+    await bob.call('PUT', `/pages/${child.id}/access`, { access: 'private', members: [] });
+    assert.equal((await carol.call('GET', `/pages/${child.id}`)).status, 404);
+    assert.equal((await carol.call('GET', `/pages/${secret.id}`)).status, 200);
+  });
+
+  test('on ne peut pas se retirer soi-même l’accès', async () => {
+    const own = (await carol.call('POST', '/pages', { title: 'Brouillon de Carol' })).data.page;
+    const res = await admin.call('PUT', `/pages/${own.id}/access`, { access: 'private', members: [{ userId: ids.carol, role: 'edit' }] });
+    assert.equal(res.status, 400); // l'admin se serait exclu
+    assert.equal((await admin.call('GET', `/pages/${own.id}`)).status, 200);
+    assert.equal((await carol.call('PUT', `/pages/${own.id}/access`, { access: 'private', members: [] })).status, 200); // la créatrice garde l'accès
+    assert.equal((await admin.call('GET', `/pages/${own.id}`)).status, 404); // un admin ne voit pas une page privée dont il n'est pas membre
+  });
+
+  test('revenir à « toute l’équipe »', async () => {
+    await bob.call('PUT', `/pages/${secret.id}/access`, { access: null });
+    await bob.call('PUT', `/pages/${child.id}/access`, { access: null });
+    assert.equal((await carol.call('GET', `/pages/${child.id}`)).data.page.canEdit, true);
+  });
+});
+
+describe('mentions dans les pages', () => {
+  let page;
+  const unread = async (who) => (await who.call('GET', '/notifications')).data;
+
+  before(async () => {
+    await carol.call('POST', '/notifications/read', {});
+    await admin.call('POST', '/notifications/read', {});
+    page = (await bob.call('POST', '/pages', { title: 'Compte rendu réunion' })).data.page;
+  });
+
+  test('mentionner quelqu’un dans une page le notifie', async () => {
+    const carolWs = socket(carol.cookie);
+    await carolWs.opened;
+    const res = await bob.call('PATCH', `/pages/${page.id}`, { content: '# Actions\n- @Carol Petit prépare le devis', version: page.version });
+    page = res.data.page;
+    const ev = await carolWs.next((e) => e.type === 'notification:new');
+    carolWs.ws.close();
+    assert.equal(ev.notification.kind, 'page_mention');
+    assert.equal(ev.notification.pageId, page.id);
+    assert.equal(ev.notification.pageTitle, 'Compte rendu réunion');
+    assert.equal(ev.notification.excerpt, '- @Carol Petit prépare le devis');
+    assert.deepEqual(res.data.mentionedWithoutAccess, []);
+  });
+
+  test('les enregistrements suivants ne renotifient pas', async () => {
+    page = (await bob.call('PATCH', `/pages/${page.id}`, { content: `${'# Actions\n- @Carol Petit prépare le devis'}\n- relire`, version: page.version })).data.page;
+    assert.equal((await unread(carol)).unread, 1);
+  });
+
+  test('push quand l’application est fermée', async () => {
+    await carol.call('POST', '/notifications/read', {});
+    await carol.call('POST', '/push/subscribe', { subscription: { endpoint: 'https://push.example/carol-pages', keys: { p256dh: 'B', auth: 'a' } } });
+    pushed.length = 0;
+    page = (await bob.call('PATCH', `/pages/${page.id}`, { content: `${page.content}\n- @Carol Petit et @Alice Martin valident`, version: page.version })).data.page;
+    await new Promise((r) => setTimeout(r, 50));
+    const forCarol = pushed.find((p) => p.endpoint === 'https://push.example/carol-pages');
+    assert.equal(forCarol.payload.title, 'Bob Durand vous a mentionné dans la page « Compte rendu réunion »');
+    assert.equal(forCarol.payload.url, `/#/p/${page.id}`);
+    await carol.call('POST', '/push/unsubscribe', { endpoint: 'https://push.example/carol-pages' });
+  });
+
+  test('personne mentionnée sans accès : pas de notification, l’auteur est prévenu', async () => {
+    const adminId = (await admin.call('GET', '/me')).data.user.id;
+    const priv = (await bob.call('POST', '/pages', { title: 'Note privée' })).data.page;
+    await bob.call('PUT', `/pages/${priv.id}/access`, { access: 'private', members: [{ userId: adminId, role: 'view' }] });
+    await carol.call('POST', '/notifications/read', {});
+    const res = await bob.call('PATCH', `/pages/${priv.id}`, { content: '@Carol Petit et @Alice Martin', version: priv.version });
+    assert.deepEqual(res.data.mentionedWithoutAccess, ['Carol Petit']);
+    assert.equal((await unread(carol)).unread, 0);
+    assert.equal((await unread(admin)).notifications[0].kind, 'page_mention');
+
+    // Si l'accès est retiré ensuite, la notification disparaît de l'Activité.
+    await bob.call('PUT', `/pages/${priv.id}/access`, { access: 'private', members: [] });
+    assert.ok(!(await unread(admin)).notifications.some((n) => n.pageId === priv.id));
+  });
+
+  test('supprimer la page supprime ses notifications', async () => {
+    await bob.call('DELETE', `/pages/${page.id}`);
+    assert.ok(!(await unread(carol)).notifications.some((n) => n.pageId === page.id));
+  });
+});

@@ -90,16 +90,20 @@ CREATE TABLE IF NOT EXISTS reactions (
   PRIMARY KEY (message_id, user_id, emoji)
 );
 
--- Fil « Activité » : mentions, réponses dans les fils suivis, réactions à ses messages.
+-- Fil « Activité » : mentions, réponses dans les fils suivis, réactions à ses messages,
+-- mentions dans les pages. Chaque notification porte sur un message OU sur une page.
 CREATE TABLE IF NOT EXISTS notifications (
   id         INTEGER PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  kind       TEXT NOT NULL CHECK (kind IN ('mention', 'reply', 'reaction')),
+  kind       TEXT NOT NULL CHECK (kind IN ('mention', 'reply', 'reaction', 'page_mention')),
   actor_id   INTEGER REFERENCES users(id) ON DELETE SET NULL,
-  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+  page_id    INTEGER REFERENCES pages(id) ON DELETE CASCADE,
   emoji      TEXT,
+  excerpt    TEXT,
   created_at INTEGER NOT NULL,
-  read_at    INTEGER
+  read_at    INTEGER,
+  emailed_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id);
 
@@ -144,6 +148,14 @@ CREATE TABLE IF NOT EXISTS page_files (
 );
 CREATE INDEX IF NOT EXISTS page_files_page ON page_files(page_id);
 
+-- Personnes autorisées sur une page à accès restreint (voir pages.access).
+CREATE TABLE IF NOT EXISTS page_members (
+  page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role    TEXT NOT NULL CHECK (role IN ('edit', 'view')),
+  PRIMARY KEY (page_id, user_id)
+);
+
 -- Abonnements aux notifications push (un par appareil).
 CREATE TABLE IF NOT EXISTS push_subscriptions (
   id         INTEGER PRIMARY KEY,
@@ -182,6 +194,30 @@ function addColumn(db, table, column, definition) {
   if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 
+// Les notifications d'avant les mentions dans les pages exigeaient un message : on reconstruit la table
+// (SQLite ne sait pas modifier une contrainte existante).
+function upgradeNotifications(db) {
+  const { sql } = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notifications'").get();
+  if (sql.includes('page_mention')) return;
+  db.exec('PRAGMA foreign_keys = OFF');
+  transaction(db, () => {
+    db.exec(`CREATE TABLE notifications_new (
+      id INTEGER PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('mention', 'reply', 'reaction', 'page_mention')),
+      actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+      page_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
+      emoji TEXT, excerpt TEXT, created_at INTEGER NOT NULL, read_at INTEGER, emailed_at INTEGER)`);
+    db.exec(`INSERT INTO notifications_new (id, user_id, kind, actor_id, message_id, emoji, created_at, read_at, emailed_at)
+      SELECT id, user_id, kind, actor_id, message_id, emoji, created_at, read_at, emailed_at FROM notifications`);
+    db.exec('DROP TABLE notifications');
+    db.exec('ALTER TABLE notifications_new RENAME TO notifications');
+    db.exec('CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, id)');
+  });
+  db.exec('PRAGMA foreign_keys = ON');
+}
+
 // Met à niveau les bases créées par une version précédente.
 function migrate(db) {
   const columns = db.prepare('PRAGMA table_info(messages)').all().map((c) => c.name);
@@ -195,6 +231,10 @@ function migrate(db) {
   addColumn(db, 'users', 'last_digest_at', 'INTEGER');
   addColumn(db, 'invites', 'email', 'TEXT');
   addColumn(db, 'notifications', 'emailed_at', 'INTEGER');
+  // Accès d'une page : NULL = comme la page parente (ou toute l'équipe en haut de l'arbre),
+  // 'edit' = toute l'équipe modifie, 'view' = toute l'équipe lit, 'private' = personnes choisies.
+  addColumn(db, 'pages', 'access', 'TEXT');
+  upgradeNotifications(db);
   // Préférence de notification par canal : NULL = réglage par défaut (tout pour les messages privés,
   // mentions pour les canaux), 'all', 'mentions' ou 'none' (muet).
   addColumn(db, 'channel_members', 'notify', 'TEXT');

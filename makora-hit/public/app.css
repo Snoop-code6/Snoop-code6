@@ -656,6 +656,7 @@ button.me:hover { background: var(--sidebar-hover); }
 .or::before, .or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
 .link { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-decoration: underline; }
 input[readonly] { background: var(--bg-soft); color: var(--muted); }
+.page-title[readonly] { background: none; color: var(--text); }
 
 /* --- Notifications par canal --- */
 
@@ -674,6 +675,21 @@ input[readonly] { background: var(--bg-soft); color: var(--muted); }
 .file-list li { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .file-list a { color: var(--text); text-decoration: none; }
 .file-list a:hover { text-decoration: underline; }
+
+/* --- Partage des pages --- */
+
+.page-lock { font-size: 11px; opacity: .8; }
+.dialog.share select { padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font: inherit; }
+.dialog.share .pick-list .row { align-items: center; }
+.mention-picker.floating {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: 16px;
+  max-width: 420px;
+  margin: 0 auto;
+  z-index: 40;
+}
 
 /* --- Fenêtres et notifications --- */
 

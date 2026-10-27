@@ -27,6 +27,8 @@ Outil de communication interne pour PME : une **messagerie d'équipe** (façon S
 - Enregistrement automatique
 - Gestion des conflits : si deux personnes modifient la même page, personne n'écrase le travail de l'autre
 - Mise à jour en direct quand un collègue modifie la page ouverte
+- **Mentions dans les pages** : `@Prénom Nom` avec suggestions ; la personne est notifiée (Activité, push, résumé email) ; si elle n'a pas accès à la page, l'auteur en est averti
+- **Accès par page** (bouton « Partager ») : toute l'équipe peut modifier (par défaut), toute l'équipe peut lire mais seules certaines personnes modifient, ou page privée réservée aux personnes choisies (lecture ou modification). Les sous-pages héritent du réglage de leur parente sauf réglage propre ; une page privée est invisible partout ailleurs (arborescence, recherche, fichiers, historique, notifications). Comme pour les canaux privés, un administrateur ne voit pas une page privée dont il ne fait pas partie
 - **Historique des versions** : qui a modifié quoi et quand, comparaison ligne à ligne avec la version actuelle, restauration en un clic (les enregistrements automatiques d'une même personne à moins de 10 minutes d'intervalle forment une seule version ; 200 versions conservées par page)
 
 **Notifications**

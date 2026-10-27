@@ -161,10 +161,9 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     takeSsoAttempt: db.prepare('DELETE FROM sso_attempts WHERE state = ? RETURNING *'),
     purgeSsoAttempts: db.prepare('DELETE FROM sso_attempts WHERE created_at < ?'),
     setEmailNotifications: db.prepare('UPDATE users SET email_notifications = ? WHERE id = ?'),
-    digestCandidates: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id,
+    digestCandidates: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id, pg.title AS page_title,
         (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count
-      FROM notifications n
-      JOIN messages m ON m.id = n.message_id
+      FROM notifications n LEFT JOIN messages m ON m.id = n.message_id LEFT JOIN pages pg ON pg.id = n.page_id
       JOIN users u ON u.id = n.user_id
       WHERE n.read_at IS NULL AND n.emailed_at IS NULL AND n.created_at <= ?
         AND u.deactivated_at IS NULL AND u.email_notifications = 1
@@ -236,20 +235,30 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     threadParticipants: db.prepare('SELECT DISTINCT user_id FROM messages WHERE (id = ?1 OR parent_id = ?1) AND user_id IS NOT NULL'),
     insertNotification: db.prepare(`INSERT INTO notifications (user_id, kind, actor_id, message_id, emoji, created_at)
       VALUES (?, ?, ?, ?, ?, ?)`),
+    insertPageNotification: db.prepare(`INSERT INTO notifications (user_id, kind, actor_id, page_id, excerpt, created_at)
+      VALUES (?, 'page_mention', ?, ?, ?, ?)`),
+    unreadPageMention: db.prepare(`SELECT 1 FROM notifications
+      WHERE user_id = ? AND page_id = ? AND kind = 'page_mention' AND read_at IS NULL`),
+    allPagesAccess: db.prepare('SELECT id, parent_id, access, created_by FROM pages'),
+    allPageMembers: db.prepare('SELECT page_id, user_id, role FROM page_members'),
+    pageMembers: db.prepare('SELECT user_id, role FROM page_members WHERE page_id = ?'),
+    clearPageMembers: db.prepare('DELETE FROM page_members WHERE page_id = ?'),
+    insertPageMember: db.prepare('INSERT INTO page_members (page_id, user_id, role) VALUES (?, ?, ?)'),
+    setPageAccess: db.prepare('UPDATE pages SET access = ? WHERE id = ?'),
     removeReactionNotification: db.prepare(`DELETE FROM notifications
       WHERE kind = 'reaction' AND actor_id = ? AND message_id = ? AND emoji = ?`),
-    notification: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id,
+    notification: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id, pg.title AS page_title,
         (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count
-      FROM notifications n JOIN messages m ON m.id = n.message_id WHERE n.id = ?`),
-    notifications: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id,
+      FROM notifications n LEFT JOIN messages m ON m.id = n.message_id LEFT JOIN pages pg ON pg.id = n.page_id WHERE n.id = ?`),
+    notifications: db.prepare(`SELECT n.*, m.body, m.channel_id, m.parent_id, pg.title AS page_title,
         (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) AS attachment_count
-      FROM notifications n JOIN messages m ON m.id = n.message_id
+      FROM notifications n LEFT JOIN messages m ON m.id = n.message_id LEFT JOIN pages pg ON pg.id = n.page_id
       WHERE n.user_id = ? ORDER BY n.id DESC LIMIT 50`),
     unreadNotifications: db.prepare('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND read_at IS NULL'),
     readNotifications: db.prepare(`UPDATE notifications SET read_at = ?
       WHERE user_id = ? AND read_at IS NULL AND id IN (SELECT value FROM json_each(?))`),
     readAllNotifications: db.prepare('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL'),
-    pages: db.prepare('SELECT id, parent_id, title, updated_at FROM pages ORDER BY created_at, id'),
+    pages: db.prepare('SELECT id, parent_id, title, updated_at, access FROM pages ORDER BY created_at, id'),
     page: db.prepare('SELECT * FROM pages WHERE id = ?'),
     insertPage: db.prepare(`INSERT INTO pages (parent_id, title, content, created_by, updated_by, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`),
@@ -275,7 +284,7 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     searchPages: db.prepare(`
       SELECT id, parent_id, title, content, updated_at FROM pages
       WHERE title LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\'
-      ORDER BY updated_at DESC LIMIT 20`),
+      ORDER BY updated_at DESC LIMIT 200`),
   };
 
   // --- Helpers d'accès -------------------------------------------------------
@@ -351,24 +360,37 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
   // --- Notifications -------------------------------------------------------
 
   function toNotification(n) {
-    const excerpt = n.body.replace(/\s+/g, ' ').trim().slice(0, 160);
+    const base = { id: n.id, kind: n.kind, actorId: n.actor_id, emoji: n.emoji, createdAt: n.created_at, read: Boolean(n.read_at) };
+    if (n.page_id) return { ...base, pageId: n.page_id, pageTitle: n.page_title ?? '', excerpt: n.excerpt ?? '' };
+    const excerpt = (n.body ?? '').replace(/\s+/g, ' ').trim().slice(0, 160);
     return {
-      id: n.id, kind: n.kind, actorId: n.actor_id, messageId: n.message_id, channelId: n.channel_id,
-      parentId: n.parent_id, emoji: n.emoji, createdAt: n.created_at, read: Boolean(n.read_at),
+      ...base, messageId: n.message_id, channelId: n.channel_id, parentId: n.parent_id,
       excerpt: excerpt || (n.attachment_count ? '📎 Pièce jointe' : ''),
     };
   }
 
-  function notify(userId, kind, actorId, messageId, emoji = null) {
-    const id = q.insertNotification.run(userId, kind, actorId, messageId, emoji, Date.now()).lastInsertRowid;
+  const notificationUrl = (n) => (n.pageId ? `/#/p/${n.pageId}` : messageUrl(n.channelId, n.parentId));
+
+  function deliver(userId, id) {
     const notification = toNotification(q.notification.get(id));
     hub.sendTo([userId], { type: 'notification:new', notification });
     pushTo(userId, {
       title: notificationTitle(notification),
       body: notification.excerpt,
-      url: messageUrl(notification.channelId, notification.parentId),
+      url: notificationUrl(notification),
       tag: `notification-${id}`,
     });
+  }
+
+  // Une notification de page n'est montrée que si la personne a (encore) accès à la page.
+  function visibleNotifications(rows, userId) {
+    const index = rows.some((r) => r.page_id) ? pageAccessIndex() : null;
+    const user = { id: userId };
+    return rows.filter((r) => !r.page_id || index.rights(r.page_id, user).view);
+  }
+
+  function notify(userId, kind, actorId, messageId, emoji = null) {
+    deliver(userId, q.insertNotification.run(userId, kind, actorId, messageId, emoji, Date.now()).lastInsertRowid);
   }
 
   const userNameOf = (id) => q.userName.get(id)?.name ?? 'Quelqu’un';
@@ -382,6 +404,7 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
 
   function notificationTitle(n) {
     const who = userNameOf(n.actorId);
+    if (n.kind === 'page_mention') return `${who} vous a mentionné dans la page « ${n.pageTitle || 'Sans titre'} »`;
     const where = channelLabel(q.channel.get(n.channelId));
     if (n.kind === 'mention') return `${who} vous a mentionné ${where}`;
     if (n.kind === 'reply') return `${who} a répondu dans un fil ${where}`;
@@ -787,13 +810,15 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     const rows = q.digestCandidates.all(now - DIGEST_DELAY_MS, now - DIGEST_MIN_INTERVAL_MS);
     const byUser = Map.groupBy(rows, (r) => r.user_id);
     let sent = 0;
-    for (const [userId, list] of byUser) {
+    for (const [userId, all] of byUser) {
       // Quelqu'un qui a l'application sous les yeux n'a pas besoin d'email.
       if (hub.isActive(userId)) continue;
+      const list = visibleNotifications(all, userId);
+      if (!list.length) continue;
       const user = q.fullUser.get(userId);
       const items = list.slice(-10).reverse().map((row) => {
         const n = toNotification(row);
-        return { title: notificationTitle(n), excerpt: n.excerpt, url: `${appUrl}${messageUrl(n.channelId, n.parentId)}` };
+        return { title: notificationTitle(n), excerpt: n.excerpt, url: `${appUrl}${notificationUrl(n)}` };
       });
       const ok = await sendMail(user.email, digestEmail({
         name: user.name, items, more: list.length - items.length, appUrl: `${appUrl}/`, settingsUrl: `${appUrl}/`,
@@ -1020,7 +1045,7 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
 
   api.get('/notifications', (req, res) => {
     res.json({
-      notifications: q.notifications.all(req.user.id).map(toNotification),
+      notifications: visibleNotifications(q.notifications.all(req.user.id), req.user.id).map(toNotification),
       unread: q.unreadNotifications.get(req.user.id).n,
     });
   });
@@ -1097,34 +1122,32 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
   const toPageFile = (f) => ({ id: f.id, pageId: f.page_id, userId: f.user_id, name: f.name, mime: f.mime, size: f.size, createdAt: f.created_at });
 
   api.post('/pages/:id/files', rawUpload, (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
+    const page = editablePage(req.params.id, req.user);
     const f = storeUpload(req);
     const id = q.insertPageFile.run(page.id, req.user.id, f.name, f.mime, f.size, f.key, Date.now()).lastInsertRowid;
     const file = toPageFile(q.pageFile.get(id));
-    hub.broadcast({ type: 'page:files', pageId: page.id });
+    emitPage(page.id, { type: 'page:files', pageId: page.id });
     res.status(201).json({ file, url: `/api/page-files/${id}` });
   });
 
   api.get('/pages/:id/files', (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
+    const page = readablePage(req.params.id, req.user);
     res.json({ files: q.pageFiles.all(page.id).map(toPageFile) });
   });
 
   api.get('/page-files/:id', (req, res) => {
     const file = q.pageFile.get(intParam(req.params.id));
-    if (!file) fail(404, 'Fichier introuvable.');
+    if (!file || !pageAccessIndex().rights(file.page_id, req.user).view) fail(404, 'Fichier introuvable.');
     serveFile(res, file);
   });
 
   api.delete('/page-files/:id', (req, res) => {
     const file = q.pageFile.get(intParam(req.params.id));
-    if (!file) fail(404, 'Fichier introuvable.');
+    if (!file || !pageAccessIndex().rights(file.page_id, req.user).view) fail(404, 'Fichier introuvable.');
     if (file.user_id !== req.user.id && req.user.role !== 'admin') fail(403, 'Seul l’auteur du fichier ou un administrateur peut le supprimer.');
     q.deletePageFile.run(file.id);
     removeFiles([file.storage_key]);
-    hub.broadcast({ type: 'page:files', pageId: file.page_id });
+    emitPage(file.page_id, { type: 'page:files', pageId: file.page_id });
     res.status(204).end();
   });
 
@@ -1168,36 +1191,192 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     return id;
   }
 
-  const pageSummary = (p) => ({ id: p.id, parentId: p.parent_id, title: p.title, updatedAt: p.updated_at });
+  // --- Accès aux pages ------------------------------------------------------
+  // Le réglage d'une page s'applique à toutes ses sous-pages, sauf à celles qui ont leur propre réglage.
+  // Le créateur de la page qui porte le réglage y a toujours accès en modification.
+  // Comme pour les canaux privés, un administrateur ne voit pas une page privée dont il n'est pas membre.
+
+  function pageAccessIndex() {
+    const pages = new Map(q.allPagesAccess.all().map((p) => [p.id, p]));
+    const members = new Map();
+    for (const m of q.allPageMembers.all()) {
+      if (!members.has(m.page_id)) members.set(m.page_id, new Map());
+      members.get(m.page_id).set(m.user_id, m.role);
+    }
+    const source = (id) => {
+      for (let p = pages.get(id); p; p = pages.get(p.parent_id)) if (p.access) return p;
+      return null;
+    };
+    return {
+      source,
+      rights(id, user) {
+        if (!pages.has(id)) return { view: false, edit: false };
+        const src = source(id);
+        if (!src || src.access === 'edit') return { view: true, edit: true };
+        const role = src.created_by === user.id ? 'edit' : members.get(src.id)?.get(user.id);
+        return { view: src.access === 'view' || Boolean(role), edit: role === 'edit' };
+      },
+    };
+  }
+
+  function readablePage(rawId, user) {
+    const page = q.page.get(intParam(rawId));
+    if (!page || !pageAccessIndex().rights(page.id, user).view) fail(404, 'Page introuvable.');
+    return page;
+  }
+
+  function editablePage(rawId, user) {
+    const page = readablePage(rawId, user);
+    if (!pageAccessIndex().rights(page.id, user).edit) fail(403, 'Vous pouvez lire cette page mais pas la modifier.');
+    return page;
+  }
+
+  // Seul le créateur de la page (ou un administrateur qui la voit) règle ses accès.
+  const canManagePage = (page, user) => page.created_by === user.id || user.role === 'admin';
+
+  function pageViewers(pageId) {
+    const index = pageAccessIndex();
+    return q.activeUsers.all().filter((u) => index.rights(pageId, u).view).map((u) => u.id);
+  }
+
+  // Les événements d'une page ne partent que vers ceux qui peuvent la voir (titre compris).
+  function emitPage(pageId, event) {
+    hub.sendTo(pageViewers(pageId), event);
+  }
+
+  function pageSummaryFor(p, index, user) {
+    const src = index.source(p.id);
+    return {
+      id: p.id, parentId: p.parent_id, title: p.title, updatedAt: p.updated_at,
+      restricted: Boolean(src && src.access !== 'edit'), canEdit: index.rights(p.id, user).edit,
+    };
+  }
+  // Résumé diffusé à tous ceux qui voient la page (les droits de modification, propres à chacun, n'y figurent pas).
+  function pageSummary(p) {
+    const src = pageAccessIndex().source(p.id);
+    return { id: p.id, parentId: p.parent_id, title: p.title, updatedAt: p.updated_at, restricted: Boolean(src && src.access !== 'edit') };
+  }
+
+  function pageDetails(page, user) {
+    const index = pageAccessIndex();
+    const src = index.source(page.id);
+    return {
+      ...toPage(page),
+      access: page.access ?? null,
+      restricted: Boolean(src && src.access !== 'edit'),
+      canEdit: index.rights(page.id, user).edit,
+      canManage: canManagePage(page, user),
+    };
+  }
+
+  // Mentions ajoutées par une modification : on compte les « @Nom » avant et après.
+  function newPageMentions(before, after, authorId) {
+    const users = q.activeUsers.all();
+    const names = users.map((u) => u.name);
+    if (!names.length) return [];
+    const count = (textValue) => {
+      const counts = new Map();
+      for (const m of textValue.matchAll(mentionRegex(names))) {
+        const name = m[2].toLowerCase();
+        counts.set(name, (counts.get(name) ?? 0) + 1);
+      }
+      return counts;
+    };
+    const was = count(before);
+    const now = count(after);
+    return users.filter((u) => u.id !== authorId && (now.get(u.name.toLowerCase()) ?? 0) > (was.get(u.name.toLowerCase()) ?? 0));
+  }
+
+  // Notifie les personnes nouvellement mentionnées qui ont accès à la page ; renvoie celles qui n'y ont pas accès.
+  function notifyPageMentions(page, before, author) {
+    const mentioned = newPageMentions(before, page.content, author.id);
+    if (!mentioned.length) return [];
+    const index = pageAccessIndex();
+    const withoutAccess = [];
+    for (const user of mentioned) {
+      if (!index.rights(page.id, user).view) {
+        withoutAccess.push(user.name);
+        continue;
+      }
+      // Pas de doublon tant que la précédente mention de cette page n'a pas été lue.
+      if (q.unreadPageMention.get(user.id, page.id)) continue;
+      const line = page.content.split('\n').find((l) => l.toLowerCase().includes(`@${user.name.toLowerCase()}`)) ?? '';
+      const excerptText = line.replace(/\s+/g, ' ').trim().slice(0, 160);
+      deliver(user.id, q.insertPageNotification.run(user.id, author.id, page.id, excerptText, Date.now()).lastInsertRowid);
+    }
+    return withoutAccess;
+  }
 
   api.get('/pages', (req, res) => {
-    res.json({ pages: q.pages.all().map(pageSummary) });
+    const index = pageAccessIndex();
+    res.json({
+      pages: q.pages.all().filter((p) => index.rights(p.id, req.user).view).map((p) => pageSummaryFor(p, index, req.user)),
+    });
   });
 
   api.post('/pages', (req, res) => {
     const parentId = checkParent(req.body?.parentId, null);
+    if (parentId) editablePage(parentId, req.user);
     const title = text(req.body?.title ?? '', 'titre', { max: 200 });
     const now = Date.now();
     const id = q.insertPage.run(parentId, title, '', req.user.id, req.user.id, now, now).lastInsertRowid;
     const page = q.page.get(id);
-    hub.broadcast({ type: 'page:changed', page: pageSummary(page), by: req.user.id });
-    res.status(201).json({ page: toPage(page) });
+    emitPage(page.id, { type: 'page:changed', page: pageSummary(page), by: req.user.id });
+    res.status(201).json({ page: pageDetails(page, req.user) });
   });
 
   api.get('/pages/:id', (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
-    res.json({ page: toPage(page) });
+    res.json({ page: pageDetails(readablePage(req.params.id, req.user), req.user) });
+  });
+
+  api.get('/pages/:id/access', (req, res) => {
+    const page = readablePage(req.params.id, req.user);
+    const src = pageAccessIndex().source(page.id);
+    res.json({
+      access: page.access ?? null,
+      effective: src?.access ?? 'edit',
+      inheritedFrom: src && src.id !== page.id ? { id: src.id, title: q.page.get(src.id).title } : null,
+      owner: (src ?? page).created_by,
+      members: q.pageMembers.all((src ?? page).id).map((m) => ({ userId: m.user_id, role: m.role })),
+      canManage: canManagePage(page, req.user),
+    });
+  });
+
+  api.put('/pages/:id/access', (req, res) => {
+    const page = readablePage(req.params.id, req.user);
+    if (!canManagePage(page, req.user)) fail(403, 'Seuls l’auteur de la page et les administrateurs peuvent régler ses accès.');
+    const access = req.body?.access ?? null;
+    if (![null, 'edit', 'view', 'private'].includes(access)) fail(400, 'Réglage d’accès invalide.');
+    const members = req.body?.members ?? [];
+    if (!Array.isArray(members) || members.length > 500) fail(400, 'Liste de personnes invalide.');
+    for (const m of members) {
+      if (!Number.isInteger(m?.userId) || !['edit', 'view'].includes(m.role) || !q.userById.get(m.userId)) {
+        fail(400, 'Liste de personnes invalide.');
+      }
+    }
+    transaction(db, () => {
+      q.setPageAccess.run(access, page.id);
+      q.clearPageMembers.run(page.id);
+      if (access === 'view' || access === 'private') {
+        for (const m of new Map(members.map((x) => [x.userId, x])).values()) q.insertPageMember.run(page.id, m.userId, m.role);
+      }
+      // On ne se retire jamais l'accès à soi-même par erreur.
+      const rights = pageAccessIndex().rights(page.id, req.user);
+      if (!rights.edit) fail(400, 'Ajoutez-vous à la liste avec le droit de modifier, sinon vous perdriez l’accès à cette page.');
+    });
+    // Certains gagnent ou perdent l'accès : chacun recharge la liste des pages qu'il peut voir.
+    hub.broadcast({ type: 'pages:refresh' });
+    res.json({ page: pageDetails(q.page.get(page.id), req.user) });
   });
 
   api.patch('/pages/:id', (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
+    const page = editablePage(req.params.id, req.user);
     const b = req.body ?? {};
     const title = b.title === undefined ? page.title : text(b.title, 'titre', { max: 200 });
     const content = b.content === undefined ? page.content : b.content;
     if (typeof content !== 'string' || content.length > 200_000) fail(400, 'Contenu invalide ou trop long.');
     const parentId = b.parentId === undefined ? page.parent_id : checkParent(b.parentId, page.id);
+    if (parentId !== page.parent_id && parentId) editablePage(parentId, req.user);
     // Verrou optimiste : si quelqu'un a enregistré entre-temps, on refuse plutôt que d'écraser son travail.
     const version = Number(b.version);
     if (version !== page.version) fail(409, 'Cette page a été modifiée par quelqu’un d’autre.');
@@ -1208,8 +1387,10 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
       if (after.title !== page.title || after.content !== page.content) recordVersion(page, after, req.user.id);
       return after;
     });
-    hub.broadcast({ type: 'page:changed', page: pageSummary(updated), version: updated.version, by: req.user.id });
-    res.json({ page: toPage(updated) });
+    if (parentId !== page.parent_id) hub.broadcast({ type: 'pages:refresh' });
+    else emitPage(updated.id, { type: 'page:changed', page: pageSummary(updated), version: updated.version, by: req.user.id });
+    const mentionedWithoutAccess = notifyPageMentions(updated, page.content, req.user);
+    res.json({ page: pageDetails(updated, req.user), mentionedWithoutAccess });
   });
 
   // Enregistre l'état « after » dans l'historique. Les enregistrements d'une même personne à moins
@@ -1238,20 +1419,19 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
   });
 
   api.get('/pages/:id/versions', (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
+    const page = readablePage(req.params.id, req.user);
     res.json({ versions: q.versions.all(page.id).map(toVersion), current: page.version });
   });
 
   api.get('/pages/:id/versions/:versionId', (req, res) => {
-    const v = q.pageVersion.get(intParam(req.params.versionId), intParam(req.params.id));
+    const page = readablePage(req.params.id, req.user);
+    const v = q.pageVersion.get(intParam(req.params.versionId), page.id);
     if (!v) fail(404, 'Version introuvable.');
     res.json({ version: toVersion(v) });
   });
 
   api.post('/pages/:id/versions/:versionId/restore', (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
+    const page = editablePage(req.params.id, req.user);
     const snapshot = q.pageVersion.get(intParam(req.params.versionId), page.id);
     if (!snapshot) fail(404, 'Version introuvable.');
     if (Number(req.body?.version) !== page.version) fail(409, 'Cette page a été modifiée par quelqu’un d’autre.');
@@ -1262,20 +1442,20 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
       recordVersion(page, after, req.user.id, { restoredFrom: snapshot.version });
       return after;
     });
-    hub.broadcast({ type: 'page:changed', page: pageSummary(updated), version: updated.version, by: req.user.id });
-    res.json({ page: toPage(updated) });
+    emitPage(updated.id, { type: 'page:changed', page: pageSummary(updated), version: updated.version, by: req.user.id });
+    res.json({ page: pageDetails(updated, req.user) });
   });
 
   api.delete('/pages/:id', (req, res) => {
-    const page = q.page.get(intParam(req.params.id));
-    if (!page) fail(404, 'Page introuvable.');
+    const page = readablePage(req.params.id, req.user);
     if (page.created_by !== req.user.id && req.user.role !== 'admin') {
       fail(403, 'Seul l’auteur de la page ou un administrateur peut la supprimer.');
     }
     const files = q.pageTreeFiles.all(page.id).map((f) => f.storage_key);
+    const viewers = pageViewers(page.id);
     q.deletePage.run(page.id);
     removeFiles(files);
-    hub.broadcast({ type: 'page:deleted', pageId: page.id });
+    hub.sendTo(viewers, { type: 'page:deleted', pageId: page.id });
     res.status(204).end();
   });
 
@@ -1286,7 +1466,9 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     if (term.length < 2) return res.json({ messages: [], pages: [] });
     const like = `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
     const messages = toMessages(q.searchMessages.all(req.user.id, like));
-    const pages = q.searchPages.all(like).map((p) => ({ ...pageSummary(p), excerpt: excerpt(p.content, term) }));
+    const index = pageAccessIndex();
+    const pages = q.searchPages.all(like).filter((p) => index.rights(p.id, req.user).view)
+      .slice(0, 20).map((p) => ({ ...pageSummary(p), excerpt: excerpt(p.content, term) }));
     res.json({ messages, pages });
   });
 

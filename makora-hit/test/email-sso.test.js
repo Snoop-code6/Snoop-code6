@@ -328,3 +328,18 @@ describe('invitation sans envoi', () => {
     assert.equal(sent.length, 0);
   });
 });
+
+describe('résumé email : mentions dans les pages', () => {
+  test('une mention de page non lue part dans le résumé, avec le lien de la page', async () => {
+    const carol = client();
+    await carol.call('POST', '/auth/login', { email: 'carol@pme.fr', password: 'nouveau-mdp-carol' });
+    await carol.call('POST', '/notifications/read', {});
+    srv.db.prepare('UPDATE users SET last_digest_at = NULL').run();
+    const page = (await admin.call('POST', '/pages', { title: 'Procédure achats' })).data.page;
+    await admin.call('PATCH', `/pages/${page.id}`, { content: 'Validation par @Carol Petit', version: page.version });
+    sent.length = 0;
+    assert.equal(await srv.app.locals.runEmailDigest(Date.now() + 16 * 60 * 1000), 1);
+    assert.match(sent[0].text, /Alice Martin vous a mentionné dans la page « Procédure achats » : « Validation par @Carol Petit »/);
+    assert.ok(sent[0].text.includes(`${PUBLIC_URL}/#/p/${page.id}`));
+  });
+});
