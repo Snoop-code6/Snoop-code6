@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "dev": "node --disable-warning=ExperimentalWarning --watch src/server.js",
-    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+    "test": "node --disable-warning=ExperimentalWarning --test --test-timeout=15000 test/*.test.js"
   },
   "dependencies": {
     "express": "^5.1.0",

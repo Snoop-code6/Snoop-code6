@@ -1399,7 +1399,9 @@ function renderPage(v) {
       h('div', { class: 'page' },
         v.banner,
         v.titleInput,
-        h('p', { class: 'muted small page-meta' }, `Modifié par ${userName(page.updatedBy)} · ${dateTimeFmt.format(page.updatedAt)}`),
+        h('div', { class: 'page-meta' },
+          h('button', { class: 'visibility', title: 'Qui peut voir cette page ? Cliquez pour partager', onclick: () => openShareDialog(v) }, visibilityLabel(page)),
+          h('span', { class: 'muted small' }, `Modifié par ${userName(page.updatedBy)} · ${dateTimeFmt.format(page.updatedAt)}`)),
         v.bodyEl,
         v.filesEl,
         renderSubpages(page.id))));
@@ -2501,6 +2503,14 @@ async function refreshPages() {
     Object.assign(v, { page, title: page.title, content: page.content });
     renderPage(v);
   } catch (err) { report(err); }
+}
+
+// Résumé lisible de qui voit la page.
+function visibilityLabel(page) {
+  if (page.effectiveAccess === 'view') return '👀 Toute l’équipe peut lire';
+  if (page.effectiveAccess !== 'private') return '👥 Toute l’équipe';
+  if (page.sharedWith > 0) return `🔒 Privée · ${page.sharedWith + 1} personnes`;
+  return page.ownerId === state.me.id ? '🔒 Privée · vous seul·e' : '🔒 Privée';
 }
 
 const ACCESS_OPTIONS = [

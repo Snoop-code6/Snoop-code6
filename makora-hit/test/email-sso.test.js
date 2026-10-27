@@ -335,7 +335,7 @@ describe('résumé email : mentions dans les pages', () => {
     await carol.call('POST', '/auth/login', { email: 'carol@pme.fr', password: 'nouveau-mdp-carol' });
     await carol.call('POST', '/notifications/read', {});
     srv.db.prepare('UPDATE users SET last_digest_at = NULL').run();
-    const page = (await admin.call('POST', '/pages', { title: 'Procédure achats' })).data.page;
+    const page = (await admin.call('POST', '/pages', { title: 'Procédure achats', access: 'edit' })).data.page;
     await admin.call('PATCH', `/pages/${page.id}`, { content: 'Validation par @Carol Petit', version: page.version });
     sent.length = 0;
     assert.equal(await srv.app.locals.runEmailDigest(Date.now() + 16 * 60 * 1000), 1);

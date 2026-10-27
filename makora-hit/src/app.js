@@ -1264,6 +1264,10 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
       ...toPage(page),
       access: page.access ?? null,
       restricted: Boolean(src && src.access !== 'edit'),
+      // Qui voit la page, pour l'indiquer à l'écran : réglage effectif et nombre de personnes ajoutées.
+      effectiveAccess: src?.access ?? 'edit',
+      sharedWith: src ? q.pageMembers.all(src.id).length : 0,
+      ownerId: (src ?? page).created_by,
       canEdit: index.rights(page.id, user).edit,
       canManage: canManagePage(page, user),
     };
@@ -1314,12 +1318,20 @@ export function createApp({ db, hub, uploadDir: dir, push = null, mailer = null,
     });
   });
 
+  // Une nouvelle page est privée (visible de son seul auteur) jusqu'à ce qu'il la partage ;
+  // une sous-page suit le réglage de sa page parente. On peut demander un autre réglage à la création.
   api.post('/pages', (req, res) => {
     const parentId = checkParent(req.body?.parentId, null);
     if (parentId) editablePage(parentId, req.user);
     const title = text(req.body?.title ?? '', 'titre', { max: 200 });
+    const access = req.body?.access ?? (parentId ? null : 'private');
+    if (![null, 'edit', 'view', 'private'].includes(access)) fail(400, 'Réglage d’accès invalide.');
     const now = Date.now();
-    const id = q.insertPage.run(parentId, title, '', req.user.id, req.user.id, now, now).lastInsertRowid;
+    const id = transaction(db, () => {
+      const pageId = q.insertPage.run(parentId, title, '', req.user.id, req.user.id, now, now).lastInsertRowid;
+      if (access) q.setPageAccess.run(access, pageId);
+      return pageId;
+    });
     const page = q.page.get(id);
     emitPage(page.id, { type: 'page:changed', page: pageSummary(page), by: req.user.id });
     res.status(201).json({ page: pageDetails(page, req.user) });

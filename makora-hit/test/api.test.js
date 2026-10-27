@@ -209,7 +209,7 @@ describe('pages', () => {
   });
 
   test('créer une page et une sous-page', async () => {
-    parent = (await bob.call('POST', '/pages', { title: 'Procédures' })).data.page;
+    parent = (await bob.call('POST', '/pages', { title: 'Procédures', access: 'edit' })).data.page;
     const child = (await bob.call('POST', '/pages', { title: 'Notes de frais', parentId: parent.id })).data.page;
     assert.equal(child.parentId, parent.id);
     assert.equal((await bob.call('POST', '/pages', { parentId: 99999 })).status, 400);
@@ -673,7 +673,7 @@ describe('historique des pages', () => {
   const save = (who, content, version) => who.call('PATCH', `/pages/${page.id}`, { content, version });
 
   before(async () => {
-    page = (await bob.call('POST', '/pages', { title: 'Charte' })).data.page;
+    page = (await bob.call('POST', '/pages', { title: 'Charte', access: 'edit' })).data.page;
   });
 
   test('les enregistrements rapprochés d’une même personne forment une seule version', async () => {
@@ -710,7 +710,7 @@ describe('historique des pages', () => {
   });
 
   test('une page existant avant l’historique garde son contenu d’origine', async () => {
-    const legacy = (await admin.call('POST', '/pages', { title: 'Ancienne' })).data.page;
+    const legacy = (await admin.call('POST', '/pages', { title: 'Ancienne', access: 'edit' })).data.page;
     srv.db.prepare("UPDATE pages SET content = 'Texte historique', version = 5 WHERE id = ?").run(legacy.id);
     await admin.call('PATCH', `/pages/${legacy.id}`, { content: 'Texte modifié', version: 5 });
     const versions = (await admin.call('GET', `/pages/${legacy.id}/versions`)).data.versions;
@@ -721,13 +721,13 @@ describe('historique des pages', () => {
 
   test('déplacer une page ne crée pas de version', async () => {
     const before = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
-    const parent = (await bob.call('POST', '/pages', { title: 'Dossier' })).data.page;
+    const parent = (await bob.call('POST', '/pages', { title: 'Dossier', access: 'edit' })).data.page;
     await bob.call('PATCH', `/pages/${page.id}`, { parentId: parent.id, version: before.current });
     assert.equal((await bob.call('GET', `/pages/${page.id}/versions`)).data.versions.length, before.versions.length);
   });
 
   test('version d’une autre page introuvable', async () => {
-    const other = (await bob.call('POST', '/pages', { title: 'Autre' })).data.page;
+    const other = (await bob.call('POST', '/pages', { title: 'Autre', access: 'edit' })).data.page;
     const { versions } = (await bob.call('GET', `/pages/${page.id}/versions`)).data;
     assert.equal((await bob.call('GET', `/pages/${other.id}/versions/${versions[0].id}`)).status, 404);
   });
@@ -1050,7 +1050,7 @@ describe('fichiers des pages', () => {
   }).then(async (r) => ({ status: r.status, data: await r.json() }));
 
   before(async () => {
-    page = (await bob.call('POST', '/pages', { title: 'Procédure qualité' })).data.page;
+    page = (await bob.call('POST', '/pages', { title: 'Procédure qualité', access: 'edit' })).data.page;
   });
 
   test('ajouter une image et un document à une page', async () => {
@@ -1118,12 +1118,12 @@ describe('accès aux pages', () => {
       bob: (await bob.call('GET', '/me')).data.user.id,
       carol: (await carol.call('GET', '/me')).data.user.id,
     };
-    secret = (await bob.call('POST', '/pages', { title: 'Plan social confidentiel' })).data.page;
+    secret = (await bob.call('POST', '/pages', { title: 'Plan social confidentiel', access: 'edit' })).data.page;
     await bob.call('PATCH', `/pages/${secret.id}`, { content: 'Budget restructuration', version: secret.version });
     child = (await bob.call('POST', '/pages', { title: 'Annexe RH', parentId: secret.id })).data.page;
   });
 
-  test('par défaut, toute l’équipe voit et modifie', async () => {
+  test('page ouverte à l’équipe : tout le monde voit et modifie', async () => {
     const page = (await carol.call('GET', `/pages/${secret.id}`)).data.page;
     assert.equal(page.canEdit, true);
     assert.equal(page.restricted, false);
@@ -1203,7 +1203,7 @@ describe('accès aux pages', () => {
   });
 
   test('on ne peut pas se retirer soi-même l’accès', async () => {
-    const own = (await carol.call('POST', '/pages', { title: 'Brouillon de Carol' })).data.page;
+    const own = (await carol.call('POST', '/pages', { title: 'Brouillon de Carol', access: 'edit' })).data.page;
     const res = await admin.call('PUT', `/pages/${own.id}/access`, { access: 'private', members: [{ userId: ids.carol, role: 'edit' }] });
     assert.equal(res.status, 400); // l'admin se serait exclu
     assert.equal((await admin.call('GET', `/pages/${own.id}`)).status, 200);
@@ -1225,7 +1225,7 @@ describe('mentions dans les pages', () => {
   before(async () => {
     await carol.call('POST', '/notifications/read', {});
     await admin.call('POST', '/notifications/read', {});
-    page = (await bob.call('POST', '/pages', { title: 'Compte rendu réunion' })).data.page;
+    page = (await bob.call('POST', '/pages', { title: 'Compte rendu réunion', access: 'edit' })).data.page;
   });
 
   test('mentionner quelqu’un dans une page le notifie', async () => {
@@ -1277,5 +1277,51 @@ describe('mentions dans les pages', () => {
   test('supprimer la page supprime ses notifications', async () => {
     await bob.call('DELETE', `/pages/${page.id}`);
     assert.ok(!(await unread(carol)).notifications.some((n) => n.pageId === page.id));
+  });
+});
+
+
+describe('pages privées par défaut', () => {
+  test('une nouvelle page n’est visible que de son auteur', async () => {
+    const page = (await bob.call('POST', '/pages', { title: 'Mes idées' })).data.page;
+    assert.equal(page.restricted, true);
+    assert.equal(page.effectiveAccess, 'private');
+    assert.equal(page.sharedWith, 0);
+    assert.equal(page.canEdit, true);
+    assert.ok(!(await carol.call('GET', '/pages')).data.pages.some((p) => p.id === page.id));
+    assert.equal((await carol.call('GET', `/pages/${page.id}`)).status, 404);
+    assert.equal((await admin.call('GET', `/pages/${page.id}`)).status, 404);
+
+    // Une sous-page suit sa page parente : privée elle aussi.
+    const sub = (await bob.call('POST', '/pages', { title: 'Brouillon', parentId: page.id })).data.page;
+    assert.equal(sub.access, null);
+    assert.equal(sub.effectiveAccess, 'private');
+    assert.equal((await carol.call('GET', `/pages/${sub.id}`)).status, 404);
+  });
+
+  test('partager avec une personne, puis avec toute l’équipe', async () => {
+    const carolId = (await carol.call('GET', '/me')).data.user.id;
+    const page = (await bob.call('POST', '/pages', { title: 'Projet à deux' })).data.page;
+    const shared = (await bob.call('PUT', `/pages/${page.id}/access`, { access: 'private', members: [{ userId: carolId, role: 'edit' }] })).data.page;
+    assert.equal(shared.sharedWith, 1);
+    assert.equal((await carol.call('GET', `/pages/${page.id}`)).data.page.canEdit, true);
+    assert.equal((await admin.call('GET', `/pages/${page.id}`)).status, 404);
+
+    const open = (await bob.call('PUT', `/pages/${page.id}/access`, { access: null })).data.page;
+    assert.equal(open.restricted, false);
+    assert.equal(open.effectiveAccess, 'edit');
+    assert.equal((await admin.call('GET', `/pages/${page.id}`)).status, 200);
+  });
+
+  test('créer directement une page ouverte à l’équipe', async () => {
+    const page = (await bob.call('POST', '/pages', { title: 'Annuaire', access: 'edit' })).data.page;
+    assert.equal(page.restricted, false);
+    assert.equal((await carol.call('GET', `/pages/${page.id}`)).status, 200);
+    assert.equal((await bob.call('POST', '/pages', { title: 'x', access: 'public' })).status, 400);
+  });
+
+  test('la page de bienvenue reste ouverte à toute l’équipe', async () => {
+    const pages = (await carol.call('GET', '/pages')).data.pages;
+    assert.ok(pages.some((p) => p.title === 'Bienvenue sur MAKORA HIT' && !p.restricted));
   });
 });
