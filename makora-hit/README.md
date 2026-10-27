@@ -121,7 +121,25 @@ Limites par rapport à l'application installée depuis Chrome (PWA) :
 
 Pour un usage quotidien, l'installation depuis Chrome (menu → Installer l'application) reste la meilleure option ; l'APK sert surtout à tester ou à distribuer l'application sans passer par le navigateur. La clé de signature est créée dans `android/build/` au premier lancement : conservez-la pour publier des mises à jour sans devoir désinstaller l'application.
 
-## Mise en ligne sur un serveur
+## Mise en ligne sur Railway (le plus simple)
+
+Tout se fait dans le navigateur, sans ligne de commande. Railway fournit une adresse HTTPS (`xxx.up.railway.app`).
+
+1. Créez un compte sur [railway.com](https://railway.com) en vous connectant avec GitHub.
+2. **New Project** → **Deploy from GitHub repo** → choisissez ce dépôt (autorisez l'accès si Railway le demande).
+3. Dans le service créé, onglet **Settings** :
+   - **Source** → *Root Directory* : `/makora-hit` ; *Branch* : la branche à déployer ;
+   - **Networking** → **Generate Domain** (avant le premier déploiement réussi : l'application a besoin de connaître son adresse).
+4. Onglet **Variables** → ajoutez :
+   - `PUBLIC_URL` = `https://${{RAILWAY_PUBLIC_DOMAIN}}`
+   - `TRUST_PROXY` = `1`
+   - `RAILWAY_RUN_UID` = `0` (Railway monte les volumes avec les droits administrateur ; sans cette variable l'application ne peut pas y écrire)
+5. Clic droit sur le service (ou **+ Create**) → **Volume**, chemin de montage : `/data`. **Indispensable** : sans volume, la base et les fichiers sont effacés à chaque redéploiement.
+6. Laissez Railway redéployer, ouvrez l'adresse générée et **créez immédiatement le compte administrateur** (le premier inscrit devient admin).
+
+Chaque nouveau commit sur la branche choisie est redéployé automatiquement ; la base est migrée au démarrage. Une seule instance (le réglage par défaut) : SQLite ne se partage pas entre plusieurs copies de l'application.
+
+## Mise en ligne sur votre propre serveur
 
 Le plus simple : un petit serveur Linux (VPS à quelques euros par mois chez OVHcloud, Scaleway, Hetzner…) avec Docker, et un nom de domaine (ou sous-domaine) qui pointe vers lui.
 
